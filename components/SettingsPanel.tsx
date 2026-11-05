@@ -36,9 +36,12 @@ import { PluginsConfig } from "./PluginsConfig";
 import { McpConfig } from "./McpConfig";
 import { ConfigButton, ConfigDetailNavigationContext, ConfigSwitch, type ConfigDetailNavigation } from "./SettingsUi";
 import { FontSettings } from "./FontSettings";
+import type { AgentBackend, AgentBackends } from "@/lib/agent-backends";
 
 interface Props {
   cwd: string | null;
+  backend?: AgentBackend;
+  backends?: AgentBackends;
   sessionId: string | null;
   initialSection: SettingsSection;
   /** A phone opens on the list of sections instead of `initialSection` (the plain Settings button). */
@@ -77,7 +80,7 @@ export function SettingsSectionIcon({ section, size = 16, strokeWidth = 1.8 }: {
   return <svg {...common}><path d="M9 7V2M15 7V2M6 13V8a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v5a6 6 0 0 1-12 0ZM12 19v3" /></svg>;
 }
 
-function GeneralSettings({ sessionId, onSessionReloaded, quoteSelectionEnabled, onQuoteSelectionChange }: Pick<Props, "sessionId" | "onSessionReloaded" | "quoteSelectionEnabled" | "onQuoteSelectionChange">) {
+function GeneralSettings({ backend = "pi", sessionId, onSessionReloaded, quoteSelectionEnabled, onQuoteSelectionChange }: Pick<Props, "backend" | "sessionId" | "onSessionReloaded" | "quoteSelectionEnabled" | "onQuoteSelectionChange">) {
   const { locale, setLocale, supportedLocales, t } = useI18n();
   const { preference, setThemePreference } = useTheme();
   const { width: chatContentWidth, setWidth: setChatContentWidth, fontSize, setFontSize } = useChatAppearance();
@@ -119,6 +122,7 @@ function GeneralSettings({ sessionId, onSessionReloaded, quoteSelectionEnabled, 
   };
 
   useEffect(() => {
+    if (backend !== "pi") return;
     let cancelled = false;
     void fetch("/api/tools/settings")
       .then(async (response) => {
@@ -130,9 +134,10 @@ function GeneralSettings({ sessionId, onSessionReloaded, quoteSelectionEnabled, 
         if (!cancelled) setShellError(cause instanceof Error ? cause.message : String(cause));
       });
     return () => { cancelled = true; };
-  }, []);
+  }, [backend]);
 
   useEffect(() => {
+    if (backend !== "pi") return;
     let cancelled = false;
     void fetch("/api/cache-miss-notices")
       .then(async (response) => {
@@ -144,7 +149,7 @@ function GeneralSettings({ sessionId, onSessionReloaded, quoteSelectionEnabled, 
         if (!cancelled) setCacheMissNoticesError(cause instanceof Error ? cause.message : String(cause));
       });
     return () => { cancelled = true; };
-  }, []);
+  }, [backend]);
 
   // pi's showCacheMissNotices (#1265); the open chat is read again to show or drop them.
   const toggleCacheMissNotices = async (enabled: boolean) => {
@@ -369,7 +374,7 @@ function GeneralSettings({ sessionId, onSessionReloaded, quoteSelectionEnabled, 
               </label>
             </div>
           </div>
-          <div className="settings-chat-option settings-chat-switch-option">
+          {backend === "pi" && <div className="settings-chat-option settings-chat-switch-option">
             <span>{t("settings.cacheMissNotices")}</span>
             <ConfigSwitch
               checked={cacheMissNotices === true}
@@ -378,10 +383,10 @@ function GeneralSettings({ sessionId, onSessionReloaded, quoteSelectionEnabled, 
               describedBy="settings-cache-miss-notices-description"
               onChange={(enabled) => void toggleCacheMissNotices(enabled)}
             />
-          </div>
+          </div>}
         </div>
-        <p id="settings-cache-miss-notices-description" className="settings-general-description">{t("settings.cacheMissNoticesDescription")}</p>
-        {cacheMissNoticesError && <p role="alert" className="settings-general-error">{cacheMissNoticesError}</p>}
+        {backend === "pi" && <p id="settings-cache-miss-notices-description" className="settings-general-description">{t("settings.cacheMissNoticesDescription")}</p>}
+        {backend === "pi" && cacheMissNoticesError && <p role="alert" className="settings-general-error">{cacheMissNoticesError}</p>}
       </section>
 
       <section className="settings-general-section">
@@ -423,7 +428,7 @@ function GeneralSettings({ sessionId, onSessionReloaded, quoteSelectionEnabled, 
         <p id="settings-files-placement-description" className="settings-general-description">{t("settings.filesPlacementDescription")}</p>
       </section>
 
-      {shellSettings?.isWindows && (
+      {backend === "pi" && shellSettings?.isWindows && (
         <section className="settings-general-section">
           <h3 className="settings-general-heading">{t("settings.shellTool")}</h3>
           <p className="settings-general-description">{t("settings.shellToolDescription")}</p>
@@ -588,8 +593,28 @@ function usePhoneSettingsLevel(isPhone: boolean, openAtHome: boolean) {
   return { level, levelRef, enter, goUp, dropHistory };
 }
 
+function ClaudeNativeSettings({ backends, section }: { backends?: AgentBackends; section: SettingsSection }) {
+  const { t } = useI18n();
+  const configuration = backends?.claude.claude;
+  const resources = configuration?.resources;
+  const resourceKey = section === "models" ? null : section as keyof NonNullable<typeof resources>;
+  const resource = resourceKey ? resources?.[resourceKey] : null;
+  return <div className="settings-section-content" style={{ maxWidth: 760 }}>
+    <h2 style={{ margin: "0 0 8px", fontSize: 17 }}>{t("claudeSettings.title")}</h2>
+    <p style={{ margin: "0 0 18px", color: "var(--text-muted)", fontSize: 13, lineHeight: 1.6 }}>{t("claudeSettings.description")}</p>
+    <div style={{ display: "grid", gap: 10 }}>
+      <div className="config-row"><span>{t("claudeSettings.model")}</span><code>{configuration?.model ?? t("claudeSettings.unresolved")}</code></div>
+      {resource && <div className="config-row"><span>{t("claudeSettings.resourceStatus")}</span><span>{resource.status}{typeof resource.count === "number" ? ` · ${resource.count}` : ""}</span></div>}
+      {(configuration?.settingSources ?? []).map((source) => <div key={`${source.scope}:${source.path}`} className="config-row"><span>{source.scope}</span><code style={{ overflowWrap: "anywhere" }}>{source.path || "~/.claude/settings.json"} · {source.exists ? t("claudeSettings.found") : t("claudeSettings.notFound")}</code></div>)}
+    </div>
+    <p style={{ marginTop: 18, color: "var(--text-muted)", fontSize: 12 }}>{t("claudeSettings.settingsHelp")}</p>
+  </div>;
+}
+
 export function SettingsPanel({
   cwd,
+  backend = "pi",
+  backends,
   sessionId,
   initialSection,
   openAtHome = false,
@@ -782,15 +807,15 @@ export function SettingsPanel({
             </nav>
           )}
           <ConfigDetailNavigationContext.Provider value={detailNavigation}>
-          {sectionHost("general", <GeneralSettings sessionId={sessionId} onSessionReloaded={onSessionReloaded} quoteSelectionEnabled={quoteSelectionEnabled} onQuoteSelectionChange={onQuoteSelectionChange} />)}
-          {sectionHost("models", <ModelsConfig embedded cwd={cwd} onClose={onClose} />)}
+          {sectionHost("general", <GeneralSettings backend={backend} sessionId={sessionId} onSessionReloaded={onSessionReloaded} quoteSelectionEnabled={quoteSelectionEnabled} onQuoteSelectionChange={onQuoteSelectionChange} />)}
+          {sectionHost("models", backend === "claude" ? <ClaudeNativeSettings backends={backends} section="models" /> : <ModelsConfig embedded cwd={cwd} onClose={onClose} />)}
           {/* Visited sections stay mounted, so the ones whose answer depends on trust take the page's
               status and load again in place when trusting from Settings › MCP changes it. */}
-          {cwd && sectionHost("skills", <SkillsConfig embedded key={cwd} cwd={cwd} trust={projectTrust} onClose={onClose} />)}
-          {cwd && sectionHost("agents", <AgentsConfig embedded key={cwd} cwd={cwd} sessionId={sessionId} trust={projectTrust} onClose={onClose} onReloaded={onSessionReloaded} />)}
-          {cwd && sectionHost("plugins", <PluginsConfig embedded key={cwd} cwd={cwd} sessionId={sessionId} trust={projectTrust} onClose={onClose} onReloaded={onSessionReloaded} />)}
-          {/* No project needed: the global mcp.json is listed alone, and a project adds its group. */}
-          {sectionHost("mcp", <McpConfig embedded key={cwd ?? ""} cwd={cwd} trust={projectTrust} onTrustProject={onOpenTrustDialog} onProjectTrustChanged={onProjectTrustChanged} onClose={onClose} />)}
+          {cwd && sectionHost("skills", backend === "claude" ? <ClaudeNativeSettings backends={backends} section="skills" /> : <SkillsConfig embedded key={cwd} cwd={cwd} trust={projectTrust} onClose={onClose} />)}
+          {cwd && sectionHost("agents", backend === "claude" ? <ClaudeNativeSettings backends={backends} section="agents" /> : <AgentsConfig embedded key={cwd} cwd={cwd} sessionId={sessionId} trust={projectTrust} onClose={onClose} onReloaded={onSessionReloaded} />)}
+          {cwd && sectionHost("plugins", backend === "claude" ? <ClaudeNativeSettings backends={backends} section="plugins" /> : <PluginsConfig embedded key={cwd} cwd={cwd} sessionId={sessionId} trust={projectTrust} onClose={onClose} onReloaded={onSessionReloaded} />)}
+          {/* Claude uses native read-only resources; Pi keeps its editors. */}
+          {sectionHost("mcp", backend === "claude" ? <ClaudeNativeSettings backends={backends} section="mcp" /> : <McpConfig embedded key={cwd ?? ""} cwd={cwd} trust={projectTrust} onTrustProject={onOpenTrustDialog} onProjectTrustChanged={onProjectTrustChanged} onClose={onClose} />)}
           </ConfigDetailNavigationContext.Provider>
         </main>
       </div>

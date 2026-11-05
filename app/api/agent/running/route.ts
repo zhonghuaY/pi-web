@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { readClaudeRuntime } from "@/lib/agent-catalog";
 import { getSessionListVersion } from "@/lib/session-reader";
 import {
   getAwaitingInputRpcSessionIds,
@@ -16,13 +17,14 @@ export const dynamic = "force-dynamic";
 // subagentsActiveSessionIds: sessions whose subagents can still start a run
 // there, so the sidebar announces their completion only after the last one.
 export async function GET() {
+  const claude = await readClaudeRuntime();
   return NextResponse.json(
     {
       sessionListVersion: getSessionListVersion(),
-      runningSessionIds: getRunningRpcSessionIds(),
-      awaitingInputSessionIds: getAwaitingInputRpcSessionIds(),
+      runningSessionIds: [...getRunningRpcSessionIds(), ...claude.runningSessionIds],
+      awaitingInputSessionIds: [...getAwaitingInputRpcSessionIds(), ...claude.awaitingInputSessionIds],
       completionNotificationSuppressedSessionIds: getCompletionNotificationSuppressedRpcSessionIds(),
-      subagentsActiveSessionIds: getSessionIdsWithUnsettledSubagentRuns(),
+      subagentsActiveSessionIds: [...getSessionIdsWithUnsettledSubagentRuns(), ...claude.subagentsActiveSessionIds],
       sessionUiStateRevision: getSessionUiStateRevision(),
     },
     { headers: { "Cache-Control": "no-store" } },

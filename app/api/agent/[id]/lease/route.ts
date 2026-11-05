@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { isClaudeKey, claudeBackend } from "@/lib/claude-routes";
 import { getRpcSession } from "@/lib/rpc-manager";
 import { hasUnsettledSubagentRun } from "@/lib/subagent-runtime";
 
@@ -12,7 +13,7 @@ export async function POST(
   { params }: { params: Promise<{ id: string }> },
 ) {
   const { id } = await params;
-  const session = getRpcSession(id);
+  const session = isClaudeKey(id) ? (await claudeBackend()).getClaudeSession(id) : getRpcSession(id);
   const alive = Boolean(session?.isAlive());
   // A wrapper built before a hot reload lacks the method; its own timer still runs.
   if (alive && typeof session!.renewIdleTimer === "function") session!.renewIdleTimer();
@@ -23,6 +24,8 @@ export async function POST(
     // An extension dialog waiting for an answer.
     awaitingInput: alive && session!.isAwaitingInput(),
     // A subagent under this session, at any depth, whose end starts a turn here.
-    subagentsActive: hasUnsettledSubagentRun(id),
+    subagentsActive: isClaudeKey(id)
+      ? Boolean(alive && session && "hasActiveSubagents" in session && session.hasActiveSubagents())
+      : hasUnsettledSubagentRun(id),
   }, { headers: { "Cache-Control": "no-store" } });
 }

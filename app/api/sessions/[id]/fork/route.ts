@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { isClaudeKey, claudeFork } from "@/lib/claude-routes";
 import { getRpcSession } from "@/lib/rpc-manager";
 import { hasJsonContentType, isApiRequestAllowed } from "@/lib/request-security";
 import { sideChatNameFromText } from "@/lib/session-family";
@@ -42,6 +43,7 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
 
   try {
     const body = await req.json().catch(() => null) as { side?: unknown; name?: unknown } | null;
+    if (isClaudeKey(id)) return claudeFork(id, body ?? {});
     const side = body?.side === true;
     const sideName = typeof body?.name === "string" ? sideChatNameFromText(body.name) ?? undefined : undefined;
     const opened = getRpcSession(id);

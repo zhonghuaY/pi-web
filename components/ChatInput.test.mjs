@@ -11,7 +11,7 @@ const jiti = createJiti(import.meta.url, {
 });
 const React = await jiti.import("react");
 const { renderToStaticMarkup } = await jiti.import("react-dom/server");
-const { ChatInput, ModelErrorBanner, ModelScopeWarningBanner, RUN_END_CLICK_GUARD_MS, autoGrowTextarea, canClearBuiltinCommandInput, canRestoreUserMessage, canRunBuiltinSlashCommandWhileStreaming, cycleListIndex, filterModelOptions, getUpwardMenuMaxHeight, getUserMessageText, getUserMessageDraftImages, isExactSlashCommand, isRunEndStrayClick, modelSupportsImageInput, offersBuiltinSlashCommandWhileStreaming, replaceLinksWithMarkdown, readImageFile, replaceTextareaRange, stacksComposerLayout, submitsSlashCommandOnEnter } = await jiti.import("./ChatInput.tsx");
+const { ChatInput, ModelErrorBanner, ModelScopeWarningBanner, RUN_END_CLICK_GUARD_MS, autoGrowTextarea, canClearBuiltinCommandInput, canRestoreUserMessage, canRunBuiltinSlashCommandWhileStreaming, cycleListIndex, filterModelOptions, getUpwardMenuMaxHeight, getUserMessageText, getUserMessageDraftImages, getVisibleBuiltinSlashCommands, isExactSlashCommand, isRunEndStrayClick, modelSupportsImageInput, offersBuiltinSlashCommandWhileStreaming, replaceLinksWithMarkdown, readImageFile, replaceTextareaRange, stacksComposerLayout, submitsSlashCommandOnEnter } = await jiti.import("./ChatInput.tsx");
 const { isBareMcpCommand } = await jiti.import("@/lib/mcp-command");
 const { ModelSelector } = await jiti.import("./ModelSelector.tsx");
 // As ChatInput.tsx imports it: on Windows jiti loads "@/lib/draft-store.ts"
@@ -677,6 +677,30 @@ test("reads attached images unchanged, leaving resizing to pi", async () => {
     globalThis.FileReader = originals.FileReader;
     globalThis.createImageBitmap = originals.createImageBitmap;
   }
+});
+
+test("Pi fixed slash commands are hidden for Claude while capability filtering still applies to Pi", () => {
+  const all = { fork: true, treeBranch: true, export: true, compact: true, mcp: true, side: true, steer: true, toolPresets: true, followUp: true };
+  assert.deepEqual(getVisibleBuiltinSlashCommands("claude", all, false).map((command) => command.name), ["name", "session", "copy", "side"]);
+  assert.deepEqual(getVisibleBuiltinSlashCommands("claude", all, true).map((command) => command.name), ["session", "copy", "side"]);
+  const restricted = { ...all, compact: false, fork: false, side: false };
+  const names = getVisibleBuiltinSlashCommands("pi", restricted, false).map((command) => command.name);
+  assert.equal(names.includes("reload"), true);
+  assert.equal(names.includes("compact"), false);
+  assert.equal(names.includes("clone"), false);
+  assert.equal(names.includes("side"), false);
+});
+
+test("backend discovery errors are visible with a retry action", () => {
+  const html = renderToStaticMarkup(
+    React.createElement(I18nProvider, null, React.createElement(ChatInput, {
+      onSend() {}, onAbort() {}, onRetryBackends() {}, isStreaming: false,
+      backendsError: "HTTP 503",
+    })),
+  );
+  assert.match(html, /role="alert"/);
+  assert.match(html, /Could not load agent backends: HTTP 503/);
+  assert.match(html, />Retry<\/button>/);
 });
 
 test("recognizes exact slash commands for one-Enter submission", () => {

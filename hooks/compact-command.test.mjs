@@ -58,6 +58,10 @@ function hook() {
   const compact = deferred();
   const scope = {
     sessionIdRef: { current: "session-1" },
+    backendRef: { current: "pi" },
+    capabilities: { fork: true, treeBranch: true, export: true, compact: true, mcp: true, side: true, steer: true, toolPresets: true, followUp: true },
+    shouldHandleWebSlashCommand: () => true,
+    createRequestId: () => "request-1",
     ensureNewSession: async () => "session-1",
     addNotice: (notice) => calls.notices.push(notice),
     isCompacting: false,

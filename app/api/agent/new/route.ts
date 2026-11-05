@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { claudeCreate } from "@/lib/claude-routes";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { existsSync } from "fs";
 import { randomUUID } from "crypto";
@@ -25,6 +26,8 @@ export async function POST(req: Request) {
   let promptAccepted = false;
   try {
     const body = await req.json() as { cwd?: string; [key: string]: unknown };
+    if (body.backend === "claude") return claudeCreate(body);
+    if (body.backend !== undefined && body.backend !== "pi") return NextResponse.json({ error: "Unknown agent backend" }, { status: 400 });
     const { cwd, ...command } = body;
     commandType = typeof command.type === "string" ? command.type : undefined;
 

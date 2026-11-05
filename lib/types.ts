@@ -1,5 +1,7 @@
 // Types mirrored from pi-mono coding-agent session-manager
 
+import type { AgentBackend, AgentCapabilities } from "@/lib/agent-backends";
+
 export interface SessionHeader {
   type: "session";
   version?: number;
@@ -355,6 +357,10 @@ export interface SessionTreeNode {
 }
 
 export interface SessionInfo {
+  /** Missing on historical Pi sessions for compatibility. */
+  backend?: AgentBackend;
+  /** Missing Pi capabilities preserve the existing full Pi feature set. */
+  capabilities?: AgentCapabilities;
   path: string;
   id: string;
   cwd: string;

@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { isClaudeKey, claudeSession, claudeRename, claudeDelete } from "@/lib/claude-routes";
 import { existsSync, statSync } from "fs";
 import {
   attachSessionProjectInfo,
@@ -28,6 +29,7 @@ export async function GET(
   { params }: { params: Promise<{ id: string }> }
 ) {
   const { id } = await params;
+  if (isClaudeKey(id)) return claudeSession(req, id);
   const perf = startServerPerf("GET /api/sessions/[id]");
   try {
     perf?.span("resolve");
@@ -189,6 +191,7 @@ export async function PATCH(
     if (typeof name !== "string") {
       return NextResponse.json({ error: "name is required" }, { status: 400 });
     }
+    if (isClaudeKey(id)) return claudeRename(id, name);
     const filePath = await resolveSessionPath(id);
     const trimmed = name.trim();
     // A session a wrapper holds is renamed in it, never on disk behind its back (#1388).
@@ -217,6 +220,7 @@ export async function DELETE(
 ) {
   const { id } = await params;
   try {
+    if (isClaudeKey(id)) return claudeDelete(id);
     const { missing } = await deleteSessions([id]);
     if (missing.length > 0) {
       return NextResponse.json({ error: "Session not found" }, { status: 404 });

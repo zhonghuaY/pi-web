@@ -17,6 +17,25 @@ import { isBlockingExtensionUiRequest } from "@/lib/browser-notifications";
 import { normalizeToolCalls } from "@/lib/normalize";
 import { AgentCommandError, agentStatusUrl, isPromptRejectedError, sendAgentCommand } from "@/lib/agent-client";
 import { createSideChat, SIDE_REFUSAL_MESSAGES } from "@/lib/side-chat-client";
+import {
+  answerAgentInteraction,
+  canLoadAgentSlashCommands,
+  DEFAULT_AGENT_BACKENDS,
+  fetchAgentBackends,
+  isAgentInteractionRequest,
+  sessionBackend,
+  sessionCapabilities,
+  shouldHandleWebSlashCommand,
+  reconcilePendingAgentInteractions,
+  requiresClaudeProjectTrust,
+  StableRequestId,
+  upsertPendingAgentInteraction,
+  type AgentBackend,
+  type AgentBackends,
+  type AgentCapabilities,
+  type AgentInteractionAnswer,
+  type PendingAgentInteraction,
+} from "@/lib/agent-backends";
 import { missingCwdFromBody } from "@/lib/missing-cwd";
 import {
   deleteSessionViewSnapshot,
@@ -51,6 +70,7 @@ import { updateExtensionWidgets } from "@/lib/extension-widgets";
 import { bareMcpOpensSettings } from "@/lib/mcp-command";
 import type { SettingsSection } from "@/lib/settings-navigation";
 import { withTranscriptNotices, type TranscriptNotice } from "@/lib/transcript-notices";
+import { validatePiSessionChoices } from "@/lib/agent-session-choices";
 import {
   enqueueExtensionUiRequest,
   removeExtensionUiRequest,
@@ -70,7 +90,10 @@ import {
 
 export interface SessionData {
   sessionId: string;
-  filePath: string;
+  backend?: AgentBackend;
+  capabilities?: AgentCapabilities;
+  effectiveModel?: string | null;
+  filePath: string | null;
   totalActiveMs: number;
   tree: SessionTreeNode[];
   leafId: string | null;
@@ -123,6 +146,7 @@ type AgentStateResponse = {
   extensionStatuses?: ExtensionStatusItem[];
   extensionWidgets?: ExtensionWidgetItem[];
   queuedMessages?: { steering?: string[]; followUp?: string[] } | null;
+  requiresProjectTrust?: boolean;
 };
 
 export interface QueuedMessages {
@@ -236,10 +260,11 @@ export interface UseAgentSessionOptions {
   onOpenSettings?: (section: SettingsSection) => void;
   setToolPreset?: (preset: ToolPreset) => void;
   deferInitialScroll?: boolean;
-  /** A fresh composer's model and reasoning picks to start with: the composer it replaces had them. */
+  /** A fresh composer's backend, model, and reasoning picks carried across cwd remounts. */
   initialNewSessionChoices?: NewSessionChoices | null;
-  /** A fresh composer reports its own model and reasoning picks, on mount and as they change. */
+  /** A fresh composer reports its immutable-on-create backend and Pi-only picks. */
   onNewSessionChoicesChange?: (choices: NewSessionChoices) => void;
+  onBackendScopeChange?: (backend: AgentBackend, capabilities: AgentCapabilities, backends: AgentBackends) => void;
   /** The page's translator, for the notices the hook writes itself. */
   t: (key: string, params?: TranslationParams) => string;
 }
@@ -254,6 +279,7 @@ type ConcreteThinkingLevel = Exclude<ThinkingLevelOption, "auto">;
  * browser's preference, which every fresh composer starts from.)
  */
 export interface NewSessionChoices {
+  backend: AgentBackend;
   model: { provider: string; modelId: string } | null;
   thinkingLevel: ConcreteThinkingLevel | null;
 }
@@ -289,6 +315,11 @@ const MODELS_RETRY_DELAYS_MS = [2_000, 5_000, 10_000];
 const MAX_NOTICES = 5;
 const NOTICE_VISIBLE_MS = 5000;
 const NOTICE_EXIT_ANIMATION_MS = 180;
+function createRequestId(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") return crypto.randomUUID();
+  return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
 function createNoticeId(): string {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
     return crypto.randomUUID();
@@ -418,11 +449,24 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const {
     session, newSessionCwd, newSessionDraftKey, onAgentEnd, onToolEnd, onAttentionNeeded, onSessionCreated, onSessionForked, onSideSession,
     modelsRefreshKey, onBranchDataChange, onSystemPromptChange, onSystemToolsChange, onSystemInfoLoaderChange, onSessionStatsPanelOpen,
-    onOpenSettings, onDebugSnapshotReaderChange,
+    onOpenSettings, onDebugSnapshotReaderChange, onBackendScopeChange,
   } = opts;
 
   const isNew = session === null && newSessionCwd !== null;
   const initialChoices = isNew ? opts.initialNewSessionChoices ?? null : null;
+  const [backend, setBackend] = useState<AgentBackend>(() => session ? sessionBackend(session) : initialChoices?.backend ?? "pi");
+  const [backends, setBackends] = useState<AgentBackends>(DEFAULT_AGENT_BACKENDS);
+  const [backendsLoading, setBackendsLoading] = useState(isNew);
+  const [backendsError, setBackendsError] = useState<string | null>(null);
+  const [backendDiscoveryAttempt, setBackendDiscoveryAttempt] = useState(0);
+  const [effectiveNativeModel, setEffectiveNativeModel] = useState<string | null>(null);
+  const [runtimeRequiresProjectTrust, setRuntimeRequiresProjectTrust] = useState<boolean | null>(null);
+  const backendRef = useRef<AgentBackend>(backend);
+  backendRef.current = backend;
+  const capabilities = useMemo(
+    () => session ? sessionCapabilities(session) : backends[backend].capabilities,
+    [backend, backends, session],
+  );
 
   const [data, setData] = useState<SessionData | null>(null);
   const [loading, setLoading] = useState(!isNew);
@@ -495,6 +539,9 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const [noticeState, dispatchNotice] = useReducer(noticeReducer, { visible: [], pending: [] });
   const [sessionStatsOverride, setSessionStatsOverride] = useState<SessionStatsInfo | null>(null);
   const [extensionDialogs, setExtensionDialogs] = useState<ExtensionUiDialogRequest[]>([]);
+  const [agentInteractions, setAgentInteractions] = useState<PendingAgentInteraction[]>([]);
+  const [pendingClaudeTrustSubmission, setPendingClaudeTrustSubmission] = useState<{ message: string; images?: AttachedImage[]; requestId: string } | null>(null);
+  const claudeProjectTrustConfirmedRef = useRef(false);
   const [extensionCustomUis, setExtensionCustomUis] = useState<ExtensionUiCustomRequest[]>([]);
   const [extensionStatuses, setExtensionStatuses] = useState<ExtensionStatusItem[]>([]);
   const [extensionWidgets, setExtensionWidgets] = useState<ExtensionWidgetItem[]>([]);
@@ -537,6 +584,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const bashRunningRef = useRef(false);
   const bashRecoveryIdRef = useRef(0);
   const handleAgentEventRef = useRef<((event: AgentEvent) => void) | null>(null);
+  const handleSendRef = useRef<((message: string, images?: AttachedImage[], requestId?: string) => Promise<void>) | null>(null);
   const initialScrollDoneRef = useRef(Boolean(opts.deferInitialScroll));
   const lastUserMsgRef = useRef<HTMLDivElement | null>(null);
   const pendingScrollToUserRef = useRef(false);
@@ -547,6 +595,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const handleNavigateRef = useRef<((entryId: string) => Promise<boolean>) | undefined>(undefined);
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
   const ensuringNewSessionRef = useRef<Promise<string | null> | null>(null);
+  const creationRequestIdRef = useRef<StableRequestId | null>(null);
+  creationRequestIdRef.current ??= new StableRequestId(createRequestId);
   // The command list as last loaded, and the get_commands request under way, if
   // any. A bare /mcp reads them to tell whose /mcp it is (handleBuiltinSlashCommand).
   // The generation moves on with every request and every clear, and only a request
@@ -639,10 +689,44 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     setToolPresetState(getPreferredToolPreset());
   }, [existingSessionId, isNew, setToolPresetState]);
 
+  const backendCwd = newSessionCwd ?? session?.cwd ?? null;
+  useEffect(() => {
+    const controller = new AbortController();
+    setBackendsLoading(true);
+    setBackendsError(null);
+    void fetchAgentBackends(backendCwd, controller.signal)
+      .then((next) => {
+        setBackends(next);
+        setBackendsError(null);
+      })
+      .catch((cause) => {
+        if (controller.signal.aborted) return;
+        setBackendsError(cause instanceof Error ? cause.message : String(cause));
+      })
+      .finally(() => { if (!controller.signal.aborted) setBackendsLoading(false); });
+    return () => controller.abort();
+  }, [backendCwd, backendDiscoveryAttempt]);
+
+  const retryBackendDiscovery = useCallback(() => setBackendDiscoveryAttempt((attempt) => attempt + 1), []);
+
+  const handleBackendChange = useCallback((next: AgentBackend) => {
+    if (!isNew || sessionIdRef.current || !backends[next].available) return;
+    backendRef.current = next;
+    setBackend(next);
+  }, [backends, isNew]);
+
   const onNewSessionChoicesChange = opts.onNewSessionChoicesChange;
   useEffect(() => {
-    if (isNew) onNewSessionChoicesChange?.({ model: newSessionModel, thinkingLevel: newSessionThinkingLevel });
-  }, [isNew, newSessionModel, newSessionThinkingLevel, onNewSessionChoicesChange]);
+    if (isNew) onNewSessionChoicesChange?.({ backend, model: newSessionModel, thinkingLevel: newSessionThinkingLevel });
+  }, [backend, isNew, newSessionModel, newSessionThinkingLevel, onNewSessionChoicesChange]);
+
+  useEffect(() => {
+    if (backend === "claude" && backends.claude.claude?.model) setEffectiveNativeModel(backends.claude.claude.model);
+  }, [backend, backends.claude.claude?.model]);
+
+  useEffect(() => {
+    onBackendScopeChange?.(backend, capabilities, backends);
+  }, [backend, backends, capabilities, onBackendScopeChange]);
 
   const scrollToBottom = useCallback((behavior: ScrollBehavior = "smooth") => {
     const container = scrollContainerRef.current;
@@ -671,6 +755,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const composerDraftKey = session?.id ?? newSessionDraftKey ?? undefined;
 
   const syncLiveModel = useCallback((state?: AgentStateResponse) => {
+    if (backendRef.current === "claude" && state?.model?.id) setEffectiveNativeModel(state.model.id);
     setLiveModel(state?.model
       ? { provider: state.model.provider, modelId: state.model.id }
       : null);
@@ -993,6 +1078,10 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   }, []);
 
   const loadTools = useCallback(async (sid: string) => {
+    if (backendRef.current !== "pi" || !capabilities.toolPresets) {
+      onSystemToolsChange?.(null);
+      return null;
+    }
     try {
       const tools = await sendAgentCommand<ToolEntry[]>(sid, { type: "get_tools" });
       if (!tools || !sessionHookMountedRef.current || sessionIdRef.current !== sid) return null;
@@ -1004,7 +1093,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       console.error("Failed to load tools:", e);
       return null;
     }
-  }, [onSystemToolsChange, setToolPresetState]);
+  }, [capabilities.toolPresets, onSystemToolsChange, setToolPresetState]);
 
   const promoteNewSession = useCallback((messageCount = 0, firstMessage = "(no messages)") => {
     const sid = sessionIdRef.current;
@@ -1020,6 +1109,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     }
     onSessionCreated?.({
       id: sid,
+      backend: backendRef.current,
+      capabilities,
       path: "",
       cwd: newSessionCwd,
       name: undefined,
@@ -1029,7 +1120,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       firstMessage,
       transient: true,
     }, provisionalDraftKey);
-  }, [isNew, newSessionCwd, newSessionDraftKey, onSessionCreated, opts.chatInputRef]);
+  }, [capabilities, isNew, newSessionCwd, newSessionDraftKey, onSessionCreated, opts.chatInputRef]);
 
   const ensureNewSession = useCallback(async () => {
     if (sessionIdRef.current) return sessionIdRef.current;
@@ -1039,19 +1130,25 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     const promise = (async () => {
       // Only send explicit user overrides. The server resolves the current
       // enabledModels scope atomically with AgentSession construction.
-      const selectedModel = newSessionModelOverrideRef.current;
-      const selectedThinkingLevel = thinkingLevelOverrideRef.current;
+      const isPi = backendRef.current === "pi";
+      const selectedModel = isPi ? newSessionModelOverrideRef.current : null;
+      const selectedThinkingLevel = isPi ? thinkingLevelOverrideRef.current : null;
       if (selectedModel) setPendingModel(selectedModel);
       // Undefined means the user never overrode the loadout: omit the field entirely
       // so pi resolves settings.json defaultTools instead of being pinned to ours (#700).
-      const toolNames = getToolNamesForPreset(toolPreset);
+      const toolNames = isPi ? getToolNamesForPreset(toolPreset) : undefined;
       sessionToolsPinnedRef.current = toolNames !== undefined;
+      // This ID belongs to the fresh composer, not one HTTP attempt. If the
+      // response is lost after registration, a retry asks for the same result.
+      const requestId = creationRequestIdRef.current!.get();
       const res = await fetch("/api/agent/new", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
+          backend: backendRef.current,
           cwd: newSessionCwd,
           type: "ensure_session",
+          requestId,
           ...(toolNames !== undefined ? { toolNames } : {}),
           ...(selectedModel ? { provider: selectedModel.provider, modelId: selectedModel.modelId } : {}),
           ...(selectedThinkingLevel
@@ -1102,6 +1199,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   // session. This is deliberately a non-prompt command: it creates no message
   // or model run, but lets users inspect the exact prompt before sending one.
   const loadSystemInfo = useCallback(async () => {
+    if (backendRef.current !== "pi") return;
     const sid = sessionIdRef.current ?? await ensureNewSession();
     if (!sid) return;
 
@@ -1129,10 +1227,17 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
 
   // Null when get_commands failed, which an empty list (a Chat-only session's) must not be mistaken for.
   const requestSlashCommands = useCallback((): Promise<SlashCommandInfo[] | null> => {
+    const existingSid = sessionIdRef.current;
+    if (!canLoadAgentSlashCommands(backendRef.current, existingSid)) {
+      // A fresh Claude composer must not create even a dormant session just to
+      // populate completion. Existing dormant sessions answer safely.
+      replaceSlashCommands([]);
+      return Promise.resolve([]);
+    }
     const generation = ++slashCommandsGenerationRef.current;
     const current = () => slashCommandsGenerationRef.current === generation;
     const load = (async () => {
-      const sid = sessionIdRef.current ?? await ensureNewSession();
+      const sid = existingSid ?? await ensureNewSession();
       if (!sid) {
         if (current()) replaceSlashCommands([]);
         return [] as SlashCommandInfo[];
@@ -1161,6 +1266,10 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   }, [ensureNewSession, replaceSlashCommands]);
 
   const loadSlashCommands = useCallback(async () => (await requestSlashCommands()) ?? [], [requestSlashCommands]);
+
+  useEffect(() => {
+    clearSlashCommands();
+  }, [backend, clearSlashCommands]);
 
   // The list a bare /mcp is decided by: the request under way (the palette starts
   // one as "/mcp" is typed, often still unanswered at Enter), else the list already
@@ -1265,7 +1374,9 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
               subagentsActive: reply.subagentsActive === true,
             },
           };
-        } catch {}
+        } catch {
+          leaseDebugRef.current.inFlightSince = null;
+        }
       }
     })();
     leaseRequestRef.current = request;
@@ -1697,6 +1808,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       setIsCompacting(state?.isCompacting ?? false);
       setAutoCompactionEnabled(state?.autoCompactionEnabled ?? true);
       setQueuedMessages(normalizeQueuedMessages(state?.queuedMessages));
+      if (state?.requiresProjectTrust !== undefined) setRuntimeRequiresProjectTrust(state.requiresProjectTrust);
       const busy = data.running && state
         && (state.isStreaming || state.isPromptRunning || state.isCompacting);
       if (busy) {
@@ -1761,6 +1873,14 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
           setExtensionDialogs((queue) => retainExtensionUiRequests(queue, pending));
           setExtensionCustomUis((queue) => retainExtensionUiRequests(queue, pending));
         }
+        if (Array.isArray(event.pendingAgentInteractionIds)) {
+          // Snapshot pruning runs before replayed requests. A request replayed
+          // immediately after connected is upserted by its own event below.
+          setAgentInteractions((queue) => reconcilePendingAgentInteractions(
+            queue,
+            event.pendingAgentInteractionIds as string[],
+          ));
+        }
         if (event.isStreaming === true) {
           cancelEventStreamGrace();
           sdkAgentActiveRef.current = true;
@@ -1814,6 +1934,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
               // Aborted turns can leave messages queued in pi (delivered with the
               // next turn); dead wrapper (no state) means the queue is gone.
               setQueuedMessages(normalizeQueuedMessages(d.state?.queuedMessages));
+              if (d.state?.requiresProjectTrust !== undefined) setRuntimeRequiresProjectTrust(d.state.requiresProjectTrust);
             })
             .catch(() => {});
         }
@@ -2045,6 +2166,17 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
           if (sessionIdRef.current) loadSession(sessionIdRef.current);
         }
         break;
+      case "claude_initialized":
+        if (typeof event.model === "string") setEffectiveNativeModel(event.model);
+        break;
+      case "agent_interaction_request":
+        if (isAgentInteractionRequest(event)) {
+          setAgentInteractions((queue) => upsertPendingAgentInteraction(queue, event));
+        }
+        break;
+      case "agent_interaction_closed":
+        setAgentInteractions((queue) => queue.filter((item) => item.id !== event.id));
+        break;
       case "extension_ui_request":
         handleExtensionUiRequest(event as ExtensionUiRequest);
         break;
@@ -2055,9 +2187,27 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   }, [addNotice, applyLiveUsage, cancelEventStreamGrace, dispatch, handleExtensionUiRequest, loadSession, markPromptLanded, notifyPromptStage, onAgentEnd, onToolEnd, refreshContextUsage, scheduleEventStreamClose, scrollToBottom, settleUiStage, syncLiveModel]);
   handleAgentEventRef.current = handleAgentEvent;
 
-  const handleSend = useCallback(async (message: string, images?: AttachedImage[]) => {
+  const handleSend = useCallback(async (message: string, images?: AttachedImage[], existingRequestId?: string) => {
     const trimmedMessage = message.trim();
     if (!trimmedMessage && !images?.length) return;
+    const requestId = existingRequestId ?? createRequestId();
+    if (backendRef.current === "claude") {
+      const status = backends.claude;
+      if (isNew && !status.available) {
+        addNotice({ type: "error", message: status.reason ?? "Claude Code is not available" });
+        restoreSubmission(message, images, composerDraftKey);
+        return;
+      }
+      const trustRequired = requiresClaudeProjectTrust(
+        isNew,
+        runtimeRequiresProjectTrust,
+        status.claude?.requiresProjectTrust,
+      );
+      if (trustRequired && !claudeProjectTrustConfirmedRef.current) {
+        setPendingClaudeTrustSubmission({ message, images, requestId });
+        return;
+      }
+    }
     if (agentRunningRef.current || bashRunningRef.current) {
       restoreSubmission(message, images, composerDraftKey);
       return;
@@ -2076,6 +2226,11 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     const isSlashCommandPrompt = !images?.length && trimmedMessage.startsWith("/");
 
     const isBashCommand = !images?.length && trimmedMessage.startsWith("!");
+    if (isBashCommand && backendRef.current !== "pi") {
+      addNotice({ type: "error", message: "Shell commands are not supported by Claude Code sessions" });
+      restoreSubmission(message, images, composerDraftKey);
+      return;
+    }
     if (isBashCommand) {
       const isExcluded = trimmedMessage.startsWith("!!");
       const bashCmd = (isExcluded ? trimmedMessage.slice(2) : trimmedMessage.slice(1)).trim();
@@ -2134,27 +2289,19 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         const selectedModel = newSessionModel;
         const existingSid = sessionIdRef.current ?? await ensuringNewSessionRef.current;
         const sid = existingSid ?? await ensureNewSession();
-
         if (!sid) throw new Error("Unable to create a session for the prompt");
         sentSessionId = sid;
-        if (selectedModel) {
+        if (selectedModel && backendRef.current === "pi") {
           setPendingModel(selectedModel);
-          if (existingSid) {
-            await sendAgentCommand(sid, { type: "set_model", provider: selectedModel.provider, modelId: selectedModel.modelId });
-          }
+          if (existingSid) await sendAgentCommand(sid, { type: "set_model", provider: selectedModel.provider, modelId: selectedModel.modelId });
         }
-        // Switching sessions unmounts this composer and closes its stream. The
-        // prompt still goes out, so the new session runs and gets its sidebar
-        // row instead of losing the submitted text (#1146).
         if (sessionHookMountedRef.current) {
-          await ensureEventsConnected(sid).catch((error) => {
-            if (sessionHookMountedRef.current) throw error;
-          });
+          await ensureEventsConnected(sid).catch((error) => { if (sessionHookMountedRef.current) throw error; });
         }
         promptRequestStarted = true;
         const queuedAck = await sendAgentCommand<{ queued?: boolean }>(sid, {
-          type: "prompt",
-          message,
+          type: "prompt", requestId, message,
+          ...(backendRef.current === "claude" && claudeProjectTrustConfirmedRef.current ? { trustProject: true } : {}),
           ...(piImages?.length ? { images: piImages } : {}),
         });
         if (queuedAck?.queued) dropOptimisticUserMessage();
@@ -2165,7 +2312,9 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         promptRequestStarted = true;
         const queuedAck = await sendAgentCommand<{ queued?: boolean }>(session.id, {
           type: "prompt",
+          requestId,
           message,
+          ...(backendRef.current === "claude" && claudeProjectTrustConfirmedRef.current ? { trustProject: true } : {}),
           ...(piImages?.length ? { images: piImages } : {}),
         });
         if (queuedAck?.queued) dropOptimisticUserMessage();
@@ -2225,7 +2374,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       setAgentPhase(null);
       dispatch({ type: "end" });
     }
-  }, [isNew, newSessionCwd, newSessionModel, session, ensureNewSession, ensureEventsConnected, promoteNewSession, waitForPromptSettlement, addNotice, releaseUnconfirmedSend, cancelEventStreamGrace, closeEvents, composerDraftKey, dispatch, reconcileAgentState, restoreSubmission, editEntryId, setEdit]);
+  }, [isNew, newSessionCwd, newSessionModel, session, ensureNewSession, ensureEventsConnected, promoteNewSession, waitForPromptSettlement, addNotice, releaseUnconfirmedSend, cancelEventStreamGrace, closeEvents, composerDraftKey, dispatch, reconcileAgentState, restoreSubmission, editEntryId, setEdit, backends.claude, runtimeRequiresProjectTrust]);
+  handleSendRef.current = handleSend;
 
   const executeBash = useCallback(async (command: string, excludeFromContext: boolean) => {
     if (agentRunningRef.current || bashRunningRef.current) return;
@@ -2282,7 +2432,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   }, [restoreRecalledPrompts]);
 
   const handleFork = useCallback(async (entryId: string) => {
-    if (bashRunningRef.current) return;
+    if (!capabilities.fork || bashRunningRef.current) return;
     const sid = sessionIdRef.current;
     if (!sid) return;
     setForkingEntryId(entryId);
@@ -2301,10 +2451,10 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     } finally {
       setForkingEntryId(null);
     }
-  }, [addNotice, onSessionForked]);
+  }, [addNotice, capabilities.fork, onSessionForked]);
 
   const handleNavigate = useCallback(async (entryId: string): Promise<boolean> => {
-    if (bashRunningRef.current) return false;
+    if (!capabilities.treeBranch || bashRunningRef.current) return false;
     const sid = sessionIdRef.current;
     if (!sid) return false;
     try {
@@ -2319,10 +2469,11 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       console.error("Failed to navigate:", e);
       return false;
     }
-  }, [loadSession]);
+  }, [capabilities.treeBranch, loadSession]);
   handleNavigateRef.current = handleNavigate;
 
   const handleLeafChange = useCallback(async (leafId: string | null) => {
+    if (!capabilities.treeBranch) return;
     // pi refuses navigate_tree mid-run: it moves the one leaf the running agent
     // appends to. Switching only the view would render the live run under
     // another branch, so the switch waits for the run like the server does.
@@ -2334,9 +2485,10 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     if (leafId) {
       sendAgentCommand(sid, { type: "navigate_tree", targetId: leafId }).catch(() => {});
     }
-  }, [isCompacting, loadContext]);
+  }, [capabilities.treeBranch, isCompacting, loadContext]);
 
   const handleModelChange = useCallback(async (provider: string, modelId: string) => {
+    if (backendRef.current !== "pi") return;
     if (isNew) {
       const selectedModel = { provider, modelId };
       newSessionModelOverrideRef.current = selectedModel;
@@ -2413,6 +2565,10 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
    */
   /** Resolves false when the compaction failed. */
   const handleCompact = useCallback(async (customInstructions?: string): Promise<boolean> => {
+    if (!capabilities.compact) {
+      addNotice({ type: "error", message: "Context compaction is not supported by this backend" });
+      return false;
+    }
     const sid = sessionIdRef.current;
     if (!sid || isCompacting) return true;
     setIsCompacting(true);
@@ -2421,6 +2577,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     try {
       const result = await sendAgentCommand<CompactCommandResult>(sid, {
         type: "compact",
+        requestId: createRequestId(),
         ...(customInstructions ? { customInstructions } : {}),
       });
       setCompactResult(readCompactResult(result, "manual"));
@@ -2433,12 +2590,16 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     } finally {
       setIsCompacting(false);
     }
-  }, [isCompacting, loadSession, promoteNewSession]);
+  }, [addNotice, capabilities.compact, isCompacting, loadSession, promoteNewSession]);
 
   // The banner otherwise stays until the next compaction, e.g. "Nothing to compact".
   const dismissCompactError = useCallback(() => setCompactError(null), []);
 
   const loadModels = useCallback(async (signal?: AbortSignal) => {
+    if (backend !== "pi") {
+      setModelList([]); setModelNames({}); setModelError(null); setModelScopeWarnings([]);
+      return;
+    }
     const modelCwd = newSessionCwd ?? session?.cwd ?? "";
     const modelsUrl = modelCwd ? `/api/models?cwd=${encodeURIComponent(modelCwd)}` : "/api/models";
     let d: ModelsResponse;
@@ -2497,17 +2658,27 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       // with one): the pick stays. An active scope does not wipe out an
       // intentionally selected unscoped model.
       const picked = newSessionModelOverrideRef.current;
-      const kept = picked && (nextModelList.length === 0
-        || Boolean(d.isScoped)
-        || nextModelList.some((m) => m.provider === picked.provider && m.id === picked.modelId));
-      if (picked && !kept) {
+      const pickedThinking = thinkingLevelOverrideRef.current;
+      const modelChoices = picked && d.isScoped
+        && !nextModelList.some((model) => model.provider === picked.provider && model.id === picked.modelId)
+        ? [...nextModelList, { provider: picked.provider, id: picked.modelId }]
+        : nextModelList;
+      const validated = validatePiSessionChoices(
+        picked, pickedThinking, modelChoices, d.thinkingLevels ?? {},
+        displayDefaultModel ? { provider: displayDefaultModel.provider, modelId: displayDefaultModel.id } : null,
+      );
+      if (picked && !validated.model) {
         newSessionModelOverrideRef.current = null;
         setNewSessionModel(null);
+      }
+      if (pickedThinking && !validated.thinking) {
+        thinkingLevelOverrideRef.current = null;
+        setNewSessionThinkingLevel(null);
       }
       // The first listed model is not necessarily the runtime's automatic choice.
       // An `enabledModels` pattern may pin a thinking level (`anthropic/*:high`).
       // Like pi, apply it to the model a new session starts with.
-      const startModel = kept ? picked : displayDefaultModel && { provider: displayDefaultModel.provider, modelId: displayDefaultModel.id };
+      const startModel = validated.model ?? (displayDefaultModel && { provider: displayDefaultModel.provider, modelId: displayDefaultModel.id });
       const pinned = startModel && d.thinkingLevelPins?.[`${startModel.provider}/${startModel.modelId}`];
       if (thinkingLevelOverrideRef.current === null) {
         setNewSessionDefaultThinkingLevel(
@@ -2515,7 +2686,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         );
       }
     }
-  }, [isNew, newSessionCwd, session?.cwd]);
+  }, [backend, isNew, newSessionCwd, session?.cwd]);
 
   // pi's /model "all" scope: names and reasoning levels of models outside
   // `enabledModels` join the maps, so a picked unscoped model shows them too.
@@ -2597,6 +2768,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
    * message's first line. Answers the refusal to show, or null.
    */
   const startSideChat = useCallback(async (prompt: string | null, name?: string): Promise<string | null> => {
+    if (!capabilities.side) return "Side chats are not supported by this backend";
     // The route refuses these too; a tab has nowhere to open another tab from.
     const relationKind = opts.session?.relation?.kind;
     if (relationKind === "side" || relationKind === "subagent") return translate(SIDE_REFUSAL_MESSAGES[relationKind]);
@@ -2608,7 +2780,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     if ("error" in result) return result.error;
     onSideSession?.(result.session, prompt);
     return null;
-  }, [onSideSession, opts.session?.relation?.kind, translate]);
+  }, [capabilities.side, onSideSession, opts.session?.relation?.kind, translate]);
 
   const handleBuiltinSlashCommand = useCallback(async (text: string): Promise<BuiltinSlashCommandResult> => {
     if (!text.startsWith("/")) return { handled: false };
@@ -2617,7 +2789,11 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
 
     const [, commandName, rawArgs = ""] = match;
     const args = rawArgs.trim();
-    const sid = sessionIdRef.current ?? await ensureNewSession();
+    if (!shouldHandleWebSlashCommand(backendRef.current, commandName)) {
+      // Native commands, including names that collide with Pi built-ins, are
+      // prompts owned by Claude rather than commands for Pi Web to swallow.
+      return { handled: false };
+    }
     const complete = (result: BuiltinSlashCommandResult): BuiltinSlashCommandResult => {
       if (!result.handled) return result;
       if (result.error) {
@@ -2628,6 +2804,22 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       }
       return result;
     };
+    if ((commandName === "compact" || commandName === "auto-compact") && !capabilities.compact) {
+      return complete({ handled: true, error: "Context compaction is not supported by this backend" });
+    }
+    if (commandName === "mcp" && !capabilities.mcp) {
+      return complete({ handled: true, error: "Pi MCP controls are not available in Claude Code sessions" });
+    }
+    if (commandName === "side" && !capabilities.side) {
+      return complete({ handled: true, error: "Side chats are not supported by this backend" });
+    }
+    if (commandName === "clone" && !capabilities.fork) {
+      return complete({ handled: true, error: "Forking is not supported by this backend" });
+    }
+    if (commandName === "reload" && backendRef.current !== "pi") {
+      return complete({ handled: true, error: "Pi resource reload is not available in Claude Code sessions" });
+    }
+    const sid = sessionIdRef.current ?? await ensureNewSession();
 
     try {
       switch (commandName) {
@@ -2748,7 +2940,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     } catch (e) {
       return complete({ handled: true, error: e instanceof Error ? e.message : String(e) });
     }
-  }, [activeLeafId, addNotice, ensureNewSession, handleCompact, isCompacting, loadModels, loadSession, loadSlashCommands, loadTools, promoteNewSession, onOpenSettings, onSessionForked, onSessionStatsPanelOpen, opts.chatInputRef, sessionStats, slashCommandsForMcp, startSideChat]);
+  }, [activeLeafId, addNotice, capabilities.compact, capabilities.fork, capabilities.mcp, capabilities.side, ensureNewSession, handleCompact, isCompacting, loadModels, loadSession, loadSlashCommands, loadTools, promoteNewSession, onOpenSettings, onSessionForked, onSessionStatsPanelOpen, opts.chatInputRef, sessionStats, slashCommandsForMcp, startSideChat]);
 
   // Let AgentSession.prompt decide atomically whether to queue against the
   // current run or start a new turn if it settled while the request was in
@@ -2774,6 +2966,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     try {
       await sendAgentCommand(sid, {
         type: "prompt",
+        requestId: createRequestId(),
         message,
         streamingBehavior: behavior,
         ...(piImages?.length ? { images: piImages } : {}),
@@ -2794,20 +2987,22 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   }, [addNotice, addUnconfirmedSendNotice, composerDraftKey, editEntryId, restoreSubmission]);
 
   const handleSteer = useCallback(async (message: string, images?: AttachedImage[]) => {
-    await sendStreamingPrompt(message, "steer", images);
-  }, [sendStreamingPrompt]);
+    if (capabilities.steer) await sendStreamingPrompt(message, "steer", images);
+  }, [capabilities.steer, sendStreamingPrompt]);
 
   const handlePromptWithStreamingBehavior = useCallback(async (
     message: string,
     behavior: "steer" | "followUp",
     images?: AttachedImage[],
   ) => {
-    await sendStreamingPrompt(message, behavior, images);
-  }, [sendStreamingPrompt]);
+    if ((behavior === "steer" && capabilities.steer) || (behavior === "followUp" && capabilities.followUp)) {
+      await sendStreamingPrompt(message, behavior, images);
+    }
+  }, [capabilities.followUp, capabilities.steer, sendStreamingPrompt]);
 
   const handleFollowUp = useCallback(async (message: string, images?: AttachedImage[]) => {
-    await sendStreamingPrompt(message, "followUp", images);
-  }, [sendStreamingPrompt]);
+    if (capabilities.followUp) await sendStreamingPrompt(message, "followUp", images);
+  }, [capabilities.followUp, sendStreamingPrompt]);
 
   const handleAbortCompaction = useCallback(async () => {
     const sid = sessionIdRef.current;
@@ -3018,6 +3213,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       if (agentState.state.extensionStatuses !== undefined) setExtensionStatuses(agentState.state.extensionStatuses ?? []);
       if (agentState.state.extensionWidgets !== undefined) setExtensionWidgets(agentState.state.extensionWidgets ?? []);
       if (agentState.state.queuedMessages !== undefined) setQueuedMessages(normalizeQueuedMessages(agentState.state.queuedMessages));
+      if (agentState.state.requiresProjectTrust !== undefined) setRuntimeRequiresProjectTrust(agentState.state.requiresProjectTrust);
     }
   }, [dispatch, loadTools, waitForBashSettlement, waitForPromptSettlement]);
 
@@ -3231,8 +3427,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const branchSwitchLocked = agentRunning || bashRunning || isCompacting;
   useEffect(() => {
     if (!onBranchDataChange) return;
-    onBranchDataChange(data?.tree ?? [], activeLeafId, handleLeafChange, branchSwitchLocked);
-  }, [data?.tree, activeLeafId, handleLeafChange, branchSwitchLocked, onBranchDataChange]);
+    onBranchDataChange(capabilities.treeBranch ? data?.tree ?? [] : [], capabilities.treeBranch ? activeLeafId : null, handleLeafChange, branchSwitchLocked);
+  }, [capabilities.treeBranch, data?.tree, activeLeafId, handleLeafChange, branchSwitchLocked, onBranchDataChange]);
 
   useEffect(() => {
     const container = scrollContainerRef.current;
@@ -3337,6 +3533,34 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     setSessionStatsOverride(null);
   }, [messages.length, contextUsage?.tokens, contextUsage?.percent, contextUsage?.contextWindow]);
 
+  const respondToAgentInteraction = useCallback(async (id: string, answer: AgentInteractionAnswer) => {
+    const sid = sessionIdRef.current;
+    if (!sid) return;
+    setAgentInteractions((queue) => queue.map((item) => item.id === id ? { ...item, submitting: true, error: null } : item));
+    try {
+      await answerAgentInteraction(sid, id, answer);
+      setAgentInteractions((queue) => queue.filter((item) => item.id !== id));
+    } catch (cause) {
+      setAgentInteractions((queue) => queue.map((item) => item.id === id
+        ? { ...item, submitting: false, error: cause instanceof Error ? cause.message : String(cause) }
+        : item));
+    }
+  }, []);
+
+  const confirmClaudeProjectTrust = useCallback(() => {
+    const pending = pendingClaudeTrustSubmission;
+    if (!pending) return;
+    claudeProjectTrustConfirmedRef.current = true;
+    setPendingClaudeTrustSubmission(null);
+    void handleSendRef.current?.(pending.message, pending.images, pending.requestId);
+  }, [pendingClaudeTrustSubmission]);
+  const cancelClaudeProjectTrust = useCallback(() => {
+    const pending = pendingClaudeTrustSubmission;
+    if (!pending) return;
+    setPendingClaudeTrustSubmission(null);
+    restoreSubmission(pending.message, pending.images, composerDraftKey);
+  }, [composerDraftKey, pendingClaudeTrustSubmission, restoreSubmission]);
+
   const thinkingLevel: ThinkingLevelOption = displayThinkingLevel ?? "auto";
   // The head of each queue is on screen; the rest wait behind it.
   const extensionDialog = extensionDialogs[0] ?? null;
@@ -3351,6 +3575,10 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   return {
     // State
     data, loading, error, activeLeafId, messages, activeToolResults, entryIds, messageKeys, historyCursor, hasEarlierMessages, earlierTurnCount, streamingStore,
+    backend, backends, backendsLoading, backendsError, retryBackendDiscovery, capabilities, handleBackendChange,
+    effectiveNativeModel: effectiveNativeModel ?? data?.effectiveModel ?? backends.claude.claude?.model ?? null,
+    agentInteraction: agentInteractions[0] ?? null, waitingAgentInteractionCount: Math.max(0, agentInteractions.length - 1), respondToAgentInteraction,
+    pendingClaudeTrustSubmission, confirmClaudeProjectTrust, cancelClaudeProjectTrust,
     agentRunning, modelNames, modelList, modelError, missingCwd, modelScopeWarnings, isModelScopeActive, allModelList, modelThinkingLevels, modelThinkingLevelMaps, newSessionModel, toolPreset, thinkingLevel,
     retryInfo, contextUsage, systemPrompt, forkingEntryId,
     isCompacting, compactError, compactResult, currentModel, displayModel, modelSwitching, sessionStats, autoCompactionEnabled,

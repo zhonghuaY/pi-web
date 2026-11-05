@@ -1,5 +1,5 @@
 import type { SUBAGENT_CONTROL_TOOL_NAMES } from "./subagents";
-import type { SessionEntry, ToolResultMessage } from "./types";
+import type { SessionEntry, SessionMessage, ToolResultMessage } from "./types";
 
 // Spelled out rather than imported: subagents.ts loads the SDK, and this module stays
 // importable on its own. The type rejects a name subagents.ts no longer registers.
@@ -21,7 +21,7 @@ const PATH_REPORTING_TOOL_NAMES = new Set<string>([...CODING_TOOL_NAMES, ...SUBA
 // script saved, often straight from MCP results.
 const CODEMODE_STORE_ENTRY_TYPE = "codemode-store";
 
-const SESSION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const SESSION_ID_RE = /^(?:claude:)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export function isValidSessionId(sessionId: string | null): sessionId is string {
   return !!sessionId && SESSION_ID_RE.test(sessionId);
@@ -136,6 +136,21 @@ export function isFilePathReferencedByEntries(filePath: string, entries: Session
     if (strings.some((text) => containsExactPathReference(text, filePath))) return true;
   }
   return false;
+}
+
+const CLAUDE_PATH_REPORTING_TOOLS = new Set(["Read", "Write", "Edit", "Bash", "Grep", "Glob", "Agent"]);
+
+export function isFilePathReferencedByClaudeMessages(filePath: string, messages: SessionMessage[]): boolean {
+  return messages.some((message) => {
+    if (message.role === "system") return false;
+    const strings: string[] = [];
+    if (message.role === "toolResult" && !CLAUDE_PATH_REPORTING_TOOLS.has(message.toolName ?? "")) {
+      collectUntrustedToolResultStrings(message, strings);
+    } else {
+      collectStrings(message, strings);
+    }
+    return strings.some((text) => containsExactPathReference(text, filePath));
+  });
 }
 
 export function isBashOutputPathReferencedByEntries(filePath: string, entries: SessionEntry[]): boolean {

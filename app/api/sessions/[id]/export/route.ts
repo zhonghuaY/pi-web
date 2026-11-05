@@ -7,6 +7,8 @@ import { promisify } from "util";
 import { fileURLToPath, pathToFileURL } from "url";
 import { NextResponse } from "next/server";
 import { resolveSessionPath } from "@/lib/session-reader";
+import { isClaudeKey, claudeBackend } from "@/lib/claude-routes";
+import { exportClaudeHtml } from "@/lib/claude-export";
 
 const execFileAsync = promisify(execFile);
 
@@ -110,6 +112,21 @@ export async function GET(
   const inline = new URL(req.url).searchParams.get("inline") === "1";
 
   try {
+    if (isClaudeKey(id)) {
+      const backend = await claudeBackend();
+      const snapshot = await backend.readClaudeSession(id);
+      const messages = await backend.getClaudeDisplayMessages(id);
+      return new Response(exportClaudeHtml(snapshot.info.name || "Claude Code session", messages), {
+        headers: {
+          "Content-Type": "text/html; charset=utf-8",
+          "Content-Disposition": getContentDisposition("claude-session-" + id.slice(7) + ".html", inline),
+          "Cache-Control": "no-store",
+          "Content-Security-Policy": "default-src 'none'; img-src data:; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'",
+          "X-Content-Type-Options": "nosniff",
+          "X-Frame-Options": "DENY",
+        },
+      });
+    }
     const filePath = await resolveSessionPath(id);
     if (!filePath) {
       return NextResponse.json({ error: "Session not found" }, { status: 404 });

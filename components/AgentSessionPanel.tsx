@@ -20,7 +20,7 @@ interface Props {
   /** Opens a subagent's read-only viewer tab in the right panel (the `Agent` card's button), or closes it when open. */
   onToggleSubagentTab: (sessionId: string, label: string, side?: boolean) => void;
   /** Forks the main agent into a side chat and opens its tab; answers the refusal to show, or null. */
-  onNewSideChat: () => Promise<string | null>;
+  onNewSideChat?: () => Promise<string | null>;
   /** Deletes one side chat and its tab; answers the failure to show, or null. */
   onDeleteSideChat: (sessionId: string) => Promise<string | null>;
 }
@@ -405,6 +405,7 @@ export function AgentSessionPanel({ rootSession, subagents, selectedSessionId, r
   const [confirmDeleteSideChatId, setConfirmDeleteSideChatId] = useState<string | null>(null);
   const [deleteSideChatError, setDeleteSideChatError] = useState<string | null>(null);
   const handleNewSideChat = async () => {
+    if (!onNewSideChat) return;
     setNewSideChatPending(true);
     setNewSideChatError(null);
     try {
@@ -530,7 +531,7 @@ export function AgentSessionPanel({ rootSession, subagents, selectedSessionId, r
             running={runningSessionIds.has(rootSession.id)}
             usage={usage[rootSession.id]}
             onSelect={() => onSelectSession(rootSession)}
-            onNewSideChat={handleNewSideChat}
+            onNewSideChat={onNewSideChat ? handleNewSideChat : undefined}
             newSideChatPending={newSideChatPending}
           />
           {(newSideChatError || deleteSideChatError) && (

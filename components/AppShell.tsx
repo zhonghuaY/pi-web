@@ -73,6 +73,7 @@ import type { BlockingExtensionUiRequest, SessionInfo, SessionTreeNode } from "@
 import type { McpErrorResponse, ProjectTrustStatus } from "@/lib/api-types";
 import type { ChatInputHandle } from "./ChatInput";
 import type { AgentEndInfo, NewSessionChoices } from "@/hooks/useAgentSession";
+import { DEFAULT_AGENT_BACKENDS, mergeAgentBackendScope, sessionBackend, sessionCapabilities, type AgentBackend, type AgentBackends, type AgentBackendScope, type AgentCapabilities } from "@/lib/agent-backends";
 import type { SessionStatsInfo } from "@/lib/pi-types";
 import { formatActiveDuration, formatCompactCount, formatCostShort } from "@/lib/session-stats-format";
 import type { FileViewerState } from "@/lib/file-viewer-state";
@@ -153,6 +154,12 @@ export function AppShell() {
     if (soundEnabledRef.current) playDoneSound();
   }, [playDoneSound, soundEnabledRef]);
   const [selectedSession, setSelectedSession] = useState<SessionInfo | null>(null);
+  const [backendScope, setBackendScope] = useState<AgentBackendScope>({
+    backend: "pi", capabilities: DEFAULT_AGENT_BACKENDS.pi.capabilities, backends: DEFAULT_AGENT_BACKENDS,
+  });
+  const handleBackendScopeChange = useCallback((backend: AgentBackend, capabilities: AgentCapabilities, backends: AgentBackends) => {
+    setBackendScope((current) => mergeAgentBackendScope(current, { backend, capabilities, backends }));
+  }, []);
   // Latest selection readable from async callbacks whose captured state is
   // stale (e.g. a delete that completes after the user navigated away).
   const selectedSessionRef = useRef(selectedSession);
@@ -218,6 +225,15 @@ export function AppShell() {
     newSessionChoicesRef.current = choices;
     setCarriedNewSessionChoices(null);
   }, []);
+  useEffect(() => {
+    if (!selectedSession) return;
+    setBackendScope((current) => {
+      const backend = sessionBackend(selectedSession);
+      const capabilities = sessionCapabilities(selectedSession);
+      return mergeAgentBackendScope(current, { ...current, backend, capabilities });
+    });
+  }, [selectedSession]);
+
   const [initialCwdStatus, setInitialCwdStatus] = useState<"idle" | "validating" | "ready" | "error">(
     () => initialNavigation.requestedCwd ? "validating" : "idle",
   );
@@ -410,6 +426,12 @@ export function AppShell() {
   // Single active panel — only one dropdown open at a time
   const [activeTopPanel, setActiveTopPanel] = useState<"agents" | "branches" | "system" | "tools" | "session" | "debug" | null>(null);
   const [topPanelPos, setTopPanelPos] = useState<{ top: number; left: number; width: number } | null>(null);
+
+  useEffect(() => {
+    if (backendScope.backend !== "pi") {
+      setActiveTopPanel((panel) => panel === "system" || panel === "tools" ? null : panel);
+    }
+  }, [backendScope.backend]);
 
   useEffect(() => {
     if (!sessionHasBranches) {
@@ -1181,7 +1203,7 @@ export function AppShell() {
 
   const handleAutoName = useCallback(async () => {
     const sessionId = selectedSession?.id;
-    if (!sessionId || autoNameStatus.kind === "naming") return;
+    if (backendScope.backend !== "pi" || !sessionId || autoNameStatus.kind === "naming") return;
     if (autoNameTimerRef.current) clearTimeout(autoNameTimerRef.current);
     setActiveTopPanel(null);
     setAutoNameStatus({ kind: "naming" });
@@ -1208,7 +1230,7 @@ export function AppShell() {
       setAutoNameStatus({ kind: "error", message });
       autoNameTimerRef.current = setTimeout(() => setAutoNameStatus({ kind: "idle" }), 5000);
     }
-  }, [autoNameStatus.kind, selectedSession?.id]);
+  }, [autoNameStatus.kind, backendScope.backend, selectedSession?.id]);
 
   useEffect(() => {
     if (autoNameTimerRef.current) clearTimeout(autoNameTimerRef.current);
@@ -1439,14 +1461,15 @@ export function AppShell() {
     if (agentTabs.some((tab) => tab.sessionId === selectedSessionId)) handleCloseFileTab(`agent:${selectedSessionId}`);
   }, [agentTabs, handleCloseFileTab, selectedSessionId]);
 
+  const canExportSession = Boolean(selectedSession && backendScope.capabilities.export);
   const handleViewFullHistory = useCallback(() => {
-    if (!selectedSession) return;
+    if (!selectedSession || !backendScope.capabilities.export) return;
     window.open(
       `/api/sessions/${encodeURIComponent(selectedSession.id)}/export?inline=1`,
       "_blank",
       "noopener,noreferrer",
     );
-  }, [selectedSession]);
+  }, [backendScope.capabilities.export, selectedSession]);
 
   // Show chat area if a session is selected, or if we have a cwd to start a new session in
   const effectiveNewSessionCwd = newSessionCwd ?? (selectedSession === null && activeCwd ? activeCwd : null);
@@ -1801,8 +1824,8 @@ export function AppShell() {
             handleViewFullHistory();
             if (mobile && isNarrowMobile) setMobileToolbarMoreOpen(true);
           }}
-          disabled={!selectedSession}
-          title={selectedSession ? translate("history.full") : translate("history.unsaved")}
+          disabled={!canExportSession}
+          title={canExportSession ? translate("history.full") : selectedSession ? translate("history.unsupported") : translate("history.unsaved")}
           aria-label={translate("history.full")}
           style={{
             display: "flex",
@@ -1816,21 +1839,21 @@ export function AppShell() {
             border: "none",
             borderTop: "2px solid transparent",
             borderRight: "1px solid var(--border)",
-            color: selectedSession ? "var(--text-muted)" : "var(--text-dim)",
-            cursor: selectedSession ? "pointer" : "not-allowed",
-            opacity: selectedSession ? 1 : 0.45,
+            color: canExportSession ? "var(--text-muted)" : "var(--text-dim)",
+            cursor: canExportSession ? "pointer" : "not-allowed",
+            opacity: canExportSession ? 1 : 0.45,
             flexShrink: 0,
             fontSize: 11,
             whiteSpace: "nowrap",
             transition: "color 0.1s, background 0.1s, opacity 0.1s",
           }}
           onMouseEnter={(event) => {
-            if (!selectedSession) return;
+            if (!canExportSession) return;
             event.currentTarget.style.color = "var(--text)";
             event.currentTarget.style.background = "var(--bg-hover)";
           }}
           onMouseLeave={(event) => {
-            event.currentTarget.style.color = selectedSession ? "var(--text-muted)" : "var(--text-dim)";
+            event.currentTarget.style.color = canExportSession ? "var(--text-muted)" : "var(--text-dim)";
             event.currentTarget.style.background = "none";
           }}
           data-mobile-toolbar-action={mobile ? "history" : undefined}
@@ -1845,7 +1868,7 @@ export function AppShell() {
             strokeLinecap="round"
             strokeLinejoin="round"
             style={{
-              color: selectedSession ? "var(--text-muted)" : "var(--text-dim)",
+              color: canExportSession ? "var(--text-muted)" : "var(--text-dim)",
               flexShrink: 0,
             }}
             aria-hidden="true"
@@ -1862,7 +1885,7 @@ export function AppShell() {
             selectedSession
             && ((sessionStats?.userMessages ?? 0) > 0 || selectedSession.messageCount > 0),
           );
-          const disabled = !selectedSession || selectedSession.transient || !hasMessages || autoNameStatus.kind === "naming";
+          const disabled = backendScope.backend !== "pi" || !selectedSession || selectedSession.transient || !hasMessages || autoNameStatus.kind === "naming";
           const isSuccess = autoNameStatus.kind === "success";
           const isError = autoNameStatus.kind === "error";
           const label = autoNameStatus.kind === "naming"
@@ -1974,6 +1997,7 @@ export function AppShell() {
             hasSession
           />
         ))}
+        {backendScope.backend === "pi" && <>
         <button
           ref={systemBtnRef}
           type="button"
@@ -2046,6 +2070,7 @@ export function AppShell() {
           </svg>
           {!mobile && <span>{translate("tools.label")}</span>}
         </button>
+        </>}
       </div>
     );
   };
@@ -2580,7 +2605,7 @@ export function AppShell() {
                   onSelectSession={handleSelectSession}
                   openSubagentTabIds={openSubagentTabIds}
                   onToggleSubagentTab={handleToggleSubagentTab}
-                  onNewSideChat={() => handleNewSideChat(activeSessionFamily.root.id)}
+                  onNewSideChat={backendScope.capabilities.side ? () => handleNewSideChat(activeSessionFamily.root.id) : undefined}
                   onDeleteSideChat={(sessionId) => handleDeleteSideChat(sessionId, activeSessionFamily.root)}
                 />
               )}
@@ -2826,6 +2851,7 @@ export function AppShell() {
               newSessionContextBar={newSessionContextBar}
               initialNewSessionChoices={selectedSession === null ? carriedNewSessionChoices : null}
               onNewSessionChoicesChange={handleNewSessionChoicesChange}
+              onBackendScopeChange={handleBackendScopeChange}
               onAgentEnd={handleAgentEnd}
               onToolEnd={handleToolEnd}
               onAttentionNeeded={handleAttentionNeeded}
@@ -3061,6 +3087,8 @@ export function AppShell() {
     {settingsSection && (
       <SettingsPanel
         cwd={projectTrustCwd}
+        backend={backendScope.backend}
+        backends={backendScope.backends}
         sessionId={selectedSession?.id ?? null}
         initialSection={settingsSection}
         openAtHome={settingsOpenAtHome}

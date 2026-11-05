@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { isClaudeKey, claudeBackend } from "@/lib/claude-routes";
 import { hasJsonContentType, isApiRequestAllowed } from "@/lib/request-security";
 import { getRpcSession } from "@/lib/rpc-manager";
 import { getSessionSettings, openSessionManager, resolveSessionPath } from "@/lib/session-reader";
@@ -35,6 +36,15 @@ function refusal(status: number, error: string) {
 }
 
 async function readSummary(id: string): Promise<SessionUsageSummary | null> {
+  if (isClaudeKey(id)) {
+    const snapshot = await (await claudeBackend()).readClaudeSession(id);
+    if (!snapshot.stats) return null;
+    return {
+      tokens: snapshot.stats.tokens, cost: snapshot.stats.cost,
+      toolCalls: snapshot.stats.toolCalls, totalActiveMs: snapshot.totalActiveMs ?? 0,
+      ...(snapshot.context.model ? { model: snapshot.context.model } : {}),
+    };
+  }
   const rpc = getRpcSession(id);
   let sm: SessionManagerLike;
   if (rpc?.isAlive()) {

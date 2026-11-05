@@ -9,7 +9,7 @@
 
 export const SESSION_UI_STATE_VERSION = 1;
 /** The session ids pi writes (UUIDs); same as `lib/session-reader.ts`. */
-export const SESSION_ID_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/;
+export const SESSION_ID_PATTERN = /^(?:[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?|claude:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i;
 export const MAX_SESSION_UI_IDS_PER_REQUEST = 500;
 /** Longest projectKey or project root a request or the file may carry. */
 const MAX_PROJECT_STRING_LENGTH = 4096;

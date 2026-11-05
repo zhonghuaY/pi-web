@@ -7,6 +7,7 @@ import { createJiti } from "jiti";
 
 const jiti = createJiti(import.meta.url, { interopDefault: true, moduleCache: false });
 const { missingCwdFromBody } = await jiti.import("../lib/missing-cwd.ts");
+const { validatePiSessionChoices } = await jiti.import("../lib/agent-session-choices.ts");
 
 const source = ts.createSourceFile(
   "useAgentSession.ts",
@@ -38,16 +39,16 @@ function setup(fetchImpl) {
   const context = {
     Error, DOMException,
     controller: new AbortController(),
-    newSessionCwd: "/project", session: null, isNew: true,
+    newSessionCwd: "/project", session: null, isNew: true, backend: "pi", backendRef: { current: "pi" },
     sessionIdRef: { current: null }, thinkingLevelOverrideRef: { current: null }, newSessionModelOverrideRef: { current: null },
     thinkingLevelPinsRef: { current: {} }, defaultThinkingLevelRef: { current: null }, allModelsLoadRef: { current: null },
     asConcreteThinkingLevel: (value) => (!value || value === "auto" ? null : value),
     fetch: fetchImpl,
-    missingCwdFromBody,
+    missingCwdFromBody, validatePiSessionChoices,
     MODELS_RETRY_DELAYS_MS: script(schedule.initializer.getText(source)).runInNewContext(),
     delay: async (ms) => { delays.push(ms); },
   };
-  for (const name of ["ModelError", "ModelsMissingCwd", "ModelNames", "ModelScopeWarnings", "IsModelScopeActive", "AllModelList", "ModelThinkingLevels", "ModelThinkingLevelMaps", "ModelList", "NewSessionDefaultModel", "NewSessionDefaultThinkingLevel", "SavedDefaultThinkingLevel", "NewSessionModel"]) {
+  for (const name of ["ModelError", "ModelsMissingCwd", "ModelNames", "ModelScopeWarnings", "IsModelScopeActive", "AllModelList", "ModelThinkingLevels", "ModelThinkingLevelMaps", "ModelList", "NewSessionDefaultModel", "NewSessionDefaultThinkingLevel", "SavedDefaultThinkingLevel", "NewSessionModel", "NewSessionThinkingLevel"]) {
     context[`set${name}`] = (value) => writes.push([name, value]);
   }
   context.loadModels = loadScript.runInNewContext(context);
@@ -180,4 +181,33 @@ test("a picked model the folder offers keeps its pinned reasoning level; one it 
   started.context.newSessionModelOverrideRef.current = { provider: "other", modelId: "gone" };
   await started.run();
   assert.deepEqual(started.context.newSessionModelOverrideRef.current, { provider: "other", modelId: "gone" });
+});
+
+test("returning from Claude to Pi reloads the cwd catalogue and rejects stale carried choices", async () => {
+  let requests = 0;
+  const state = setup(async () => {
+    requests += 1;
+    return Response.json({
+      models: { "new:valid": "Valid" },
+      modelList: [{ provider: "new", id: "valid", name: "Valid" }],
+      defaultModel: { provider: "new", modelId: "valid" },
+      thinkingLevels: { "new:valid": ["low"] },
+    });
+  });
+  state.context.newSessionModelOverrideRef.current = { provider: "old", modelId: "stale" };
+  state.context.thinkingLevelOverrideRef.current = "high";
+
+  state.context.backend = "claude";
+  state.context.backendRef.current = "claude";
+  await state.context.loadModels();
+  assert.equal(requests, 0, "Claude never reads the Pi model catalogue");
+
+  state.context.backend = "pi";
+  state.context.backendRef.current = "pi";
+  await state.context.loadModels();
+  assert.equal(requests, 1);
+  assert.equal(state.context.newSessionModelOverrideRef.current, null);
+  assert.equal(state.context.thinkingLevelOverrideRef.current, null);
+  assert.ok(state.writes.some(([name, value]) => name === "NewSessionModel" && value === null));
+  assert.ok(state.writes.some(([name, value]) => name === "NewSessionThinkingLevel" && value === null));
 });

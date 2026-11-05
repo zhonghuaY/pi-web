@@ -49,6 +49,7 @@ const nextConfig: NextConfig = {
     "undici",
     "web-push",
     "@earendil-works/pi-coding-agent",
+    "@anthropic-ai/claude-agent-sdk",
     "@earendil-works/pi-agent-core",
     "@earendil-works/pi-ai",
     "@earendil-works/pi-tui",

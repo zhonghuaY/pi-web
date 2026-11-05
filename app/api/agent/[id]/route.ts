@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { isClaudeKey, claudeCommand, claudeState } from "@/lib/claude-routes";
 import { resolveSessionPath } from "@/lib/session-reader";
 import { startRpcSession, getRpcSession, setRpcSessionTools } from "@/lib/rpc-manager";
 import { cwdMissingBody, missingCwdFromBody } from "@/lib/missing-cwd";
@@ -14,6 +15,7 @@ export async function POST(
 
   try {
     const body = await req.json() as { type: string; [key: string]: unknown };
+    if (isClaudeKey(id)) return claudeCommand(id, body);
     commandType = typeof body.type === "string" ? body.type : undefined;
     const requestedToolNames = body.toolNames;
     if (
@@ -81,6 +83,7 @@ export async function GET(
   const { id } = await params;
 
   try {
+    if (isClaudeKey(id)) return claudeState(id);
     const session = getRpcSession(id);
     if (!session || !session.isAlive()) {
       return NextResponse.json({ running: false });

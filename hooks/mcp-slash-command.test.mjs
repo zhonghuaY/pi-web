@@ -57,6 +57,10 @@ function hook({ commands = [], pending = null, getCommands = async () => ({ comm
   const calls = { notices: [], opened: [], requests: [], lists: [], errors: [], loading: [] };
   const scope = {
     sessionIdRef: { current: "session-1" },
+    backendRef: { current: "pi" },
+    capabilities: { fork: true, treeBranch: true, export: true, compact: true, mcp: true, side: true, steer: true, toolPresets: true, followUp: true },
+    canLoadAgentSlashCommands: () => true,
+    shouldHandleWebSlashCommand: () => true,
     ensureNewSession: async () => "session-1",
     addNotice: (notice) => calls.notices.push(notice),
     onOpenSettings: openSettings ? (section) => calls.opened.push(section) : undefined,

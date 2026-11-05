@@ -1,4 +1,5 @@
 import { createAgentEventStream } from "@/lib/agent-event-stream";
+import { isClaudeKey, claudeEvents } from "@/lib/claude-routes";
 import { resolveSessionPath } from "@/lib/session-reader";
 import { getRpcSession, startRpcSession } from "@/lib/rpc-manager";
 import { isValidLivenessHolder } from "@/lib/session-liveness";
@@ -14,6 +15,7 @@ export async function GET(
   { params }: { params: Promise<{ id: string }> }
 ) {
   const { id } = await params;
+  if (isClaudeKey(id)) return claudeEvents(req, id);
   if (req.signal.aborted) return new Response(null, { status: 204 });
   const holderParam = new URL(req.url).searchParams.get("holder");
   const holder = isValidLivenessHolder(holderParam) ? holderParam : null;

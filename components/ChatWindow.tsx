@@ -18,6 +18,9 @@ import { dropMentionText, splitDroppedItems, uploadFiles, type DroppedItem } fro
 import { MessageView } from "./MessageView";
 import { MarkdownBody } from "./MarkdownBody";
 import { ChatInput, type ChatInputHandle } from "./ChatInput";
+import { ClaudeSubagentHistory } from "./ClaudeSubagentHistory";
+import { AgentInteractionDialog, ClaudeProjectTrustDialog } from "./AgentInteractionDialog";
+import type { AgentBackend, AgentBackends, AgentCapabilities } from "@/lib/agent-backends";
 import { ChatMinimap, useMessageRefs } from "./ChatMinimap";
 import { ExtensionStatusBar } from "./ExtensionStatusBar";
 import { AnsiText } from "./AnsiText";
@@ -61,6 +64,7 @@ interface Props {
   /** A fresh composer's model and reasoning picks, carried from the composer it replaces. */
   initialNewSessionChoices?: NewSessionChoices | null;
   onNewSessionChoicesChange?: (choices: NewSessionChoices) => void;
+  onBackendScopeChange?: (backend: AgentBackend, capabilities: AgentCapabilities, backends: AgentBackends) => void;
   onAgentEnd?: (end: AgentEndInfo) => void;
   onToolEnd?: (toolName: string) => void;
   onAttentionNeeded?: (request: BlockingExtensionUiRequest) => void;
@@ -254,7 +258,7 @@ function ProcessDetailsGroup({ messageCount, toolCallCount, durationMs, cacheMis
   );
 }
 
-export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initialScrollPosition, onScrollPositionChange, sessionRunning, newSessionCwd, newSessionDraftKey, newSessionContextBar, initialNewSessionChoices, onNewSessionChoicesChange, onAgentEnd, onToolEnd, onAttentionNeeded, onSessionCreated, onSessionForked, panel = false, onSideSession, modelsRefreshKey, chatInputRef, onBranchDataChange, onSystemPromptChange, onSystemToolsChange, onSystemInfoLoaderChange, onDebugSnapshotReaderChange, onSessionStatsChange, onSessionStatsPanelOpen, onOpenSettings, onContextUsageChange, onOpenFile, onFilesUploaded, onOpenSubagent, quoteSelectionEnabled = false, initialPrompt, onInitialPromptConsumed, soundEnabled = true, onSoundToggle, playDoneSound = () => {}, unlockAudio, holdAudio }: Props) {
+export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initialScrollPosition, onScrollPositionChange, sessionRunning, newSessionCwd, newSessionDraftKey, newSessionContextBar, initialNewSessionChoices, onNewSessionChoicesChange, onBackendScopeChange, onAgentEnd, onToolEnd, onAttentionNeeded, onSessionCreated, onSessionForked, panel = false, onSideSession, modelsRefreshKey, chatInputRef, onBranchDataChange, onSystemPromptChange, onSystemToolsChange, onSystemInfoLoaderChange, onDebugSnapshotReaderChange, onSessionStatsChange, onSessionStatsPanelOpen, onOpenSettings, onContextUsageChange, onOpenFile, onFilesUploaded, onOpenSubagent, quoteSelectionEnabled = false, initialPrompt, onInitialPromptConsumed, soundEnabled = true, onSoundToggle, playDoneSound = () => {}, unlockAudio, holdAudio }: Props) {
   const { t } = useI18n();
   const isMobile = useIsMobile();
   const completionNotificationsEnabled = !isHiddenRelation(session?.relation);
@@ -285,6 +289,7 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
 
   const {
     loading, error, messages, activeToolResults, entryIds, messageKeys, historyCursor, hasEarlierMessages, earlierTurnCount, streamingStore,
+    backend, backends, backendsLoading, backendsError, retryBackendDiscovery, capabilities, handleBackendChange, effectiveNativeModel, agentInteraction, waitingAgentInteractionCount, respondToAgentInteraction, pendingClaudeTrustSubmission, confirmClaudeProjectTrust, cancelClaudeProjectTrust,
     agentRunning, bashRunning, pendingBash, modelNames, modelList, modelError, missingCwd, modelScopeWarnings, isModelScopeActive, allModelList, modelThinkingLevels, modelThinkingLevelMaps, toolPreset, thinkingLevel,
     retryInfo, contextUsage, forkingEntryId,
     isCompacting, compactError, compactResult, displayModel: displayModelValue, modelSwitching, sessionStats,
@@ -308,7 +313,7 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
     handleToolPresetChange, handleThinkingLevelChange, handleSetDefaultModel, handleSetDefaultThinkingLevel, loadSlashCommands, loadAllModels, scrollUserMsgToTop,
     loadContext, activeLeafId, scrollToBottom, scrollToMessage,
   } = useAgentSession({
-    session, sessionRunning, newSessionCwd, newSessionDraftKey, initialNewSessionChoices, onNewSessionChoicesChange, onAgentEnd: wrappedOnAgentEnd, onToolEnd, onAttentionNeeded, onSessionCreated, onSessionForked, onSideSession,
+    session, sessionRunning, newSessionCwd, newSessionDraftKey, initialNewSessionChoices, onNewSessionChoicesChange, onBackendScopeChange, onAgentEnd: wrappedOnAgentEnd, onToolEnd, onAttentionNeeded, onSessionCreated, onSessionForked, onSideSession,
     modelsRefreshKey, chatInputRef, onBranchDataChange, onSystemPromptChange, onSystemToolsChange, onSystemInfoLoaderChange, onSessionStatsPanelOpen,
     onOpenSettings, onDebugSnapshotReaderChange, t,
     deferInitialScroll: Boolean(pendingScrollRestore),
@@ -952,11 +957,20 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
       ref={chatInputRef}
       onSend={handleSend}
       onAbort={handleAbort}
-      onSideChat={onSideSession && !isHiddenRelation(session?.relation) ? askInSideChat : undefined}
-      onSteer={agentRunning ? handleSteer : undefined}
-      onFollowUp={agentRunning ? handleFollowUp : undefined}
-      onPromptWithStreamingBehavior={agentRunning ? handlePromptWithStreamingBehavior : undefined}
+      onSideChat={capabilities.side && onSideSession && !isHiddenRelation(session?.relation) ? askInSideChat : undefined}
+      onSteer={agentRunning && capabilities.steer ? handleSteer : undefined}
+      onFollowUp={agentRunning && capabilities.followUp ? handleFollowUp : undefined}
+      onPromptWithStreamingBehavior={agentRunning && (capabilities.steer || capabilities.followUp) ? handlePromptWithStreamingBehavior : undefined}
       isStreaming={sessionBusy}
+      backend={backend}
+      backends={backends}
+      backendsLoading={backendsLoading}
+      backendsError={backendsError}
+      onRetryBackends={retryBackendDiscovery}
+      capabilities={capabilities}
+      onBackendChange={isNew ? handleBackendChange : undefined}
+      effectiveNativeModel={effectiveNativeModel}
+      shellCommandsEnabled={backend === "pi"}
       model={displayModelValue}
       isAutoModelSelection={isAutoModelSelection}
       modelNames={modelNames}
@@ -965,33 +979,33 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
       missingCwd={missingCwd}
       modelScopeWarnings={modelScopeWarnings}
       allModelList={allModelList}
-      onLoadAllModels={isModelScopeActive ? loadAllModels : undefined}
-      onModelChange={handleModelChange}
+      onLoadAllModels={backend === "pi" && isModelScopeActive ? loadAllModels : undefined}
+      onModelChange={backend === "pi" ? handleModelChange : undefined}
       modelSwitching={modelSwitching}
       defaultModel={defaultModel}
       onSetDefaultModel={handleSetDefaultModel}
-      onCompact={session || isNew ? handleCompact : undefined}
+      onCompact={capabilities.compact && (session || isNew) ? handleCompact : undefined}
       onAbortCompaction={handleAbortCompaction}
       isCompacting={isCompacting}
       compactError={compactError}
       onDismissCompactError={dismissCompactError}
       compactResult={compactResult}
       toolPreset={toolPreset}
-      onToolPresetChange={(session && !isHiddenRelation(session.relation)) || isNew ? handleToolPresetChange : undefined}
+      onToolPresetChange={capabilities.toolPresets && ((session && !isHiddenRelation(session.relation)) || isNew) ? handleToolPresetChange : undefined}
       thinkingLevel={thinkingLevel}
       isAutoThinkingSelection={isAutoThinkingSelection}
-      onThinkingLevelChange={session || isNew ? handleThinkingLevelChange : undefined}
+      onThinkingLevelChange={backend === "pi" && (session || isNew) ? handleThinkingLevelChange : undefined}
       availableThinkingLevels={availableThinkingLevels}
       thinkingLevelMap={currentThinkingLevelMap}
       savedDefaultThinkingLevel={savedDefaultThinkingLevel}
-      onSetDefaultThinkingLevel={session || isNew ? handleSetDefaultThinkingLevel : undefined}
+      onSetDefaultThinkingLevel={backend === "pi" && (session || isNew) ? handleSetDefaultThinkingLevel : undefined}
       retryInfo={retryInfo}
       queuedMessages={queuedMessages}
       inputHistory={inputHistory}
-      onRecallQueue={handleRecallQueue}
+      onRecallQueue={capabilities.steer || capabilities.followUp ? handleRecallQueue : undefined}
       slashCommands={slashCommands}
       slashCommandsLoading={slashCommandsLoading}
-      onLoadSlashCommands={loadSlashCommands}
+      onLoadSlashCommands={backend === "pi" || session ? loadSlashCommands : undefined}
       onBuiltinCommand={handleBuiltinSlashCommand}
       soundEnabled={soundEnabled}
       onSoundToggle={onSoundToggle}
@@ -1076,7 +1090,16 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
         <NoticeShelf notices={notices} floating onPauseChange={setNoticePaused} />
       </div>
 
+      {backend === "claude" && session && (
+        <ClaudeSubagentHistory key={session.id} sessionId={session.id} cwd={session.cwd} onOpenFile={onOpenFile} />
+      )}
       <div className="relative flex min-h-0 min-w-0 flex-1 overflow-hidden">
+        {pendingClaudeTrustSubmission && (session?.cwd ?? newSessionCwd) && (
+          <ClaudeProjectTrustDialog cwd={(session?.cwd ?? newSessionCwd)!} existingSession={Boolean(session)} onConfirm={confirmClaudeProjectTrust} onCancel={cancelClaudeProjectTrust} />
+        )}
+        {agentInteraction && (
+          <AgentInteractionDialog key={agentInteraction.id} request={agentInteraction} waitingCount={waitingAgentInteractionCount} onRespond={respondToAgentInteraction} />
+        )}
         {extensionDialog && (
           <ExtensionDialog key={extensionDialog.id} request={extensionDialog} waitingCount={waitingExtensionDialogCount} onRespond={respondToExtensionUi} />
         )}
@@ -1158,9 +1181,9 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
                     onOpenSubagent={onOpenSubagent}
                     entryId={entryIds[idx]}
                     searchBlock={entryIds[idx] === pendingSearchScroll?.entryId ? searchBlock : undefined}
-                    onFork={bashRunning || isNew ? undefined : handleFork}
+                    onFork={capabilities.fork && !bashRunning && !isNew ? handleFork : undefined}
                     forking={forkingEntryId === entryIds[idx]}
-                    onEditContent={sessionBusy ? undefined : handleEditContent}
+                    onEditContent={sessionBusy || !capabilities.treeBranch ? undefined : handleEditContent}
                     onCancelEdit={cancelEdit}
                     isEditing={editEntryId === entryIds[idx]}
                     showTimestamp={showTimestamp}
@@ -1168,7 +1191,7 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
                     sessionId={session?.id ?? sessionIdRef.current ?? undefined}
                     writtenFiles={options.writtenFiles}
                     turnDurationMs={options.turnDurationMs}
-                    onCompact={options.recoverTruncation ? handleCompact : undefined}
+                    onCompact={options.recoverTruncation && capabilities.compact ? handleCompact : undefined}
                     isCompacting={options.recoverTruncation ? isCompacting : undefined}
                     compactError={options.recoverTruncation ? compactError : undefined}
                   />

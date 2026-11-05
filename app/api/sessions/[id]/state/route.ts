@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { isClaudeKey, claudeState } from "@/lib/claude-routes";
 import { getRpcSession } from "@/lib/rpc-manager";
 import { resolveSessionPath } from "@/lib/session-reader";
 
@@ -8,6 +9,7 @@ export async function GET(
 ) {
   const { id } = await params;
   try {
+    if (isClaudeKey(id)) return claudeState(id);
     const rpc = getRpcSession(id);
     if (rpc?.isAlive()) {
       const state = await rpc.send({ type: "get_state" });

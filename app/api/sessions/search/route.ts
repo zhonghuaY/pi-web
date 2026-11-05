@@ -1,6 +1,8 @@
 import { NextResponse } from "next/server";
 import { listAllSessions } from "@/lib/session-reader";
 import { searchSessionContents } from "@/lib/session-search";
+import { readClaudeCatalogue } from "@/lib/agent-catalog";
+import { searchClaudeSessions } from "@/lib/claude-search";
 
 export const dynamic = "force-dynamic";
 
@@ -21,7 +23,14 @@ export async function GET(request: Request) {
     const sessions = query && !request.signal.aborted ? await listAllSessions({ allowStale: true }) : [];
     // A side chat copies its parent's whole text and never opens as the main chat.
     const searchable = sessions.filter((session) => session.relation?.kind !== "side");
-    return NextResponse.json(await searchSessionContents(searchable, query, request.signal), { headers });
+    const [pi, claude] = await Promise.all([
+      searchSessionContents(searchable, query, request.signal),
+      query && !request.signal.aborted
+        ? readClaudeCatalogue().then(({ sessions }) => searchClaudeSessions(sessions, query, request.signal))
+        : Promise.resolve({ results: [], truncated: false }),
+    ]);
+    const results = [...pi.results, ...claude.results].sort((a, b) => b.session.modified.localeCompare(a.session.modified));
+    return NextResponse.json({ results: results.slice(0, 30), truncated: pi.truncated || claude.truncated || results.length > 30 }, { headers });
   } catch (error) {
     return NextResponse.json({ error: String(error) }, { status: 500, headers });
   }

@@ -4,6 +4,7 @@ import React, { memo, useRef, useState, useCallback, useEffect, useLayoutEffect,
 import type { BuiltinSlashCommandResult, CompactResultInfo, QueuedMessages, SlashCommandInfo } from "@/hooks/useAgentSession";
 import type { SkillsResponse } from "@/lib/api-types";
 import type { TextContent, UserMessage } from "@/lib/types";
+import { shouldHandleWebSlashCommand, type AgentBackend, type AgentBackends, type AgentCapabilities } from "@/lib/agent-backends";
 import {
   clearDraft,
   getDraft,
@@ -54,6 +55,15 @@ interface Props {
   onFollowUp?: (message: string, images?: AttachedImage[]) => void;
   onPromptWithStreamingBehavior?: (message: string, behavior: "steer" | "followUp", images?: AttachedImage[]) => void;
   isStreaming: boolean;
+  backend?: AgentBackend;
+  backends?: AgentBackends;
+  backendsLoading?: boolean;
+  backendsError?: string | null;
+  onRetryBackends?: () => void;
+  capabilities?: AgentCapabilities;
+  onBackendChange?: (backend: AgentBackend) => void;
+  effectiveNativeModel?: string | null;
+  shellCommandsEnabled?: boolean;
   /** Text-only composer without the session controls or outer spacing. */
   compact?: boolean;
   model?: { provider: string; modelId: string } | null;
@@ -323,6 +333,24 @@ const BUILTIN_SLASH_COMMANDS: BuiltinSlashCommand[] = [
   // mid-stream. The fork is file-level, never touching the running agent.
   { name: "side", description: "chat.commandSide", source: "builtin", availableWhileStreaming: true },
 ];
+
+export function getVisibleBuiltinSlashCommands(
+  backend: AgentBackend,
+  capabilities: AgentCapabilities | undefined,
+  streaming: boolean,
+): BuiltinSlashCommand[] {
+  const commands = streaming
+    ? BUILTIN_SLASH_COMMANDS.filter((command) => command.availableWhileStreaming)
+    : BUILTIN_SLASH_COMMANDS;
+  return commands.filter((command) => {
+    if (!shouldHandleWebSlashCommand(backend, command.name)) return false;
+    if (!capabilities) return true;
+    if (command.name === "compact" || command.name === "auto-compact") return capabilities.compact;
+    if (command.name === "clone") return capabilities.fork;
+    if (command.name === "side") return capabilities.side;
+    return true;
+  });
+}
 
 function getBuiltinSlashCommand(message: string): BuiltinSlashCommand | undefined {
   const match = message.trim().match(/^\/([^\s]+)(?:\s|$)/);
@@ -691,7 +719,7 @@ export function ModelScopeWarningBanner({ warnings }: { warnings?: string[] }) {
 // Memoized: its props hold still while a reply streams or a tool runs, and the
 // chat around it re-renders through both.
 export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatInput({
-  onSend, onAbort, onSteer, onSideChat, onFollowUp, isStreaming, model, isAutoModelSelection, modelNames, modelList, modelError, missingCwd, modelScopeWarnings, allModelList, onLoadAllModels, onModelChange, modelSwitching,
+  onSend, onAbort, onSteer, onSideChat, onFollowUp, isStreaming, backend = "pi", backends, backendsLoading = false, backendsError, onRetryBackends, capabilities, onBackendChange, effectiveNativeModel, shellCommandsEnabled = true, model, isAutoModelSelection, modelNames, modelList, modelError, missingCwd, modelScopeWarnings, allModelList, onLoadAllModels, onModelChange, modelSwitching,
   defaultModel, onSetDefaultModel,
   onCompact, onAbortCompaction, isCompacting, compactError, onDismissCompactError, compactResult, toolPreset, onToolPresetChange,
   thinkingLevel, isAutoThinkingSelection = false, onThinkingLevelChange, availableThinkingLevels, thinkingLevelMap,
@@ -721,7 +749,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
     draftKey ? draftImagesToAttachedImages(getDraft(draftKey)?.images) : []
   ));
   const trimmedValue = value.trimStart();
-  const bashMode = attachedImages.length === 0 && trimmedValue.startsWith("!");
+  const bashMode = shellCommandsEnabled && attachedImages.length === 0 && trimmedValue.startsWith("!");
   const bashExcluded = bashMode && trimmedValue.startsWith("!!");
   const [slashMenuOpen, setSlashMenuOpen] = useState(false);
   const [slashActiveIndex, setSlashActiveIndex] = useState(0);
@@ -1139,10 +1167,8 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
 
   const filteredSlashCommands = (() => {
     if (slashQuery === null) return [];
-    const builtinCommands = isStreaming
-      ? BUILTIN_SLASH_COMMANDS.filter((command) => command.availableWhileStreaming)
-      : BUILTIN_SLASH_COMMANDS;
-    const commands = [...builtinCommands, ...(slashCommands ?? [])];
+    const allowedBuiltins = getVisibleBuiltinSlashCommands(backend, capabilities, isStreaming);
+    const commands = [...allowedBuiltins, ...(slashCommands ?? [])];
     return filterSlashCommands(commands, slashQuery, t);
   })();
 
@@ -2509,6 +2535,13 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
           </div>
         )}
 
+        {!compact && backendsError && (
+          <div role="alert" style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, marginTop: 6, padding: "6px 8px", borderRadius: 8, background: "rgba(239,68,68,0.08)", color: "#dc2626", fontSize: 11 }}>
+            <span>{t("chat.backendDiscoveryFailed")}: {backendsError}</span>
+            {onRetryBackends && <button type="button" onClick={onRetryBackends} style={{ border: "1px solid currentColor", borderRadius: 6, background: "transparent", color: "inherit", padding: "3px 7px", cursor: "pointer" }}>{t("chat.retry")}</button>}
+          </div>
+        )}
+
         {/* Bottom bar: left | center (context) | right */}
         {!compact && <div className="chat-input-controls" style={{
           marginTop: isMobile ? 4 : 8,
@@ -2548,8 +2581,30 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
                 <polyline points="21 15 16 10 5 21" />
               </svg>
             </button>
-            {/* Model selector - visible always, busy while a switch is pending; a switch during a run applies from its next request */}
-            {(modelOptions.length > 0 || model || modelError) && onModelChange && (
+            {onBackendChange ? (
+              <select
+                value={backend}
+                onChange={(event) => onBackendChange(event.target.value as AgentBackend)}
+                disabled={isStreaming || backendsLoading}
+                aria-label={t("chat.backend")}
+                title={backends?.[backend].reason ?? t("chat.backend")}
+                style={{ height: 32, maxWidth: 112, border: "none", borderRadius: 9, background: "var(--bg-hover)", color: "var(--text)", padding: "0 8px", fontSize: 12 }}
+              >
+                <option value="pi" disabled={backends?.pi.available === false}>Pi</option>
+                <option value="claude" disabled={backends?.claude.available === false}>Claude</option>
+              </select>
+            ) : (
+              <span title={t("chat.backendLocked")} style={{ padding: "0 6px", color: "var(--text-muted)", fontSize: 11, whiteSpace: "nowrap" }}>
+                {backend === "claude" ? "Claude" : "Pi"}
+              </span>
+            )}
+            {backend === "claude" && (
+              <span title={t("chat.nativeModelHelp")} style={{ maxWidth: 220, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--text-muted)", fontSize: 11 }}>
+                {effectiveNativeModel ?? t("chat.nativeModelUnresolved")}
+              </span>
+            )}
+            {/* Pi model selector; the Claude native settings model is read-only above. */}
+            {backend === "pi" && (modelOptions.length > 0 || model || modelError) && onModelChange && (
               <ModelSelector
                 options={modelOptions}
                 value={model}

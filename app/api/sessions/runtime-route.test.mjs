@@ -5,6 +5,9 @@ import { join } from "node:path";
 import { gunzipSync } from "node:zlib";
 import test from "node:test";
 import { createJiti } from "jiti";
+import { isolateClaudeHome } from "../../../lib/claude-test-home.mjs";
+
+await isolateClaudeHome();
 
 const jiti = createJiti(import.meta.url, {
   alias: { "@": process.cwd() },
