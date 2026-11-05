@@ -29,8 +29,14 @@ export async function claudeCreate(body: Record<string, unknown>): Promise<Respo
     if (body.type !== "prompt" && body.type !== "ensure_session") {
       return NextResponse.json({ error: "Unsupported new-session command" }, { status: 400 });
     }
-    if (body.provider !== undefined || body.modelId !== undefined || body.thinkingLevel !== undefined || body.toolNames !== undefined) {
-      return NextResponse.json({ error: "Claude uses its native settings, not Pi model or tool selections" }, { status: 400 });
+    if (body.provider !== undefined || body.thinkingLevel !== undefined || body.toolNames !== undefined) {
+      return NextResponse.json({ error: "Claude does not accept Pi provider, thinking level, or tool selections" }, { status: 400 });
+    }
+    if (body.modelId !== undefined && (typeof body.modelId !== "string" || !body.modelId.trim())) {
+      return NextResponse.json({ error: "Claude modelId must be a non-empty string" }, { status: 400 });
+    }
+    if (body.effort !== undefined && (typeof body.effort !== "string" || !["low", "medium", "high", "xhigh", "max"].includes(body.effort))) {
+      return NextResponse.json({ error: "Unsupported Claude effort level" }, { status: 400 });
     }
     if (typeof body.requestId !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(body.requestId)) {
       return NextResponse.json({ error: "A stable requestId UUID is required" }, { status: 400 });
@@ -39,6 +45,8 @@ export async function claudeCreate(body: Record<string, unknown>): Promise<Respo
     const session = await backend.createClaudeSession(body.cwd, {
       requestId: body.requestId,
       trustProject: body.trustProject === true,
+      ...(typeof body.modelId === "string" ? { modelId: body.modelId } : {}),
+      ...(typeof body.effort === "string" ? { effort: body.effort } : {}),
     });
     allowFileRoot(body.cwd);
     invalidateSessionListCache();

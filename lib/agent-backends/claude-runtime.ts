@@ -37,6 +37,23 @@ export interface ClaudeAgentEvent {
   [key: string]: unknown;
 }
 
+function projectClaudeCommands(values: unknown[], terminalOnlyNames: readonly string[] = []): Record<string, unknown>[] {
+  const terminalOnly = new Set(terminalOnlyNames);
+  const byName = new Map<string, Record<string, unknown>>();
+  for (const value of values) {
+    if (!isRecord(value) || typeof value.name !== "string" || terminalOnly.has(value.name)) continue;
+    const row = {
+      name: value.name,
+      description: typeof value.description === "string" ? value.description : "",
+      argumentHint: typeof value.argumentHint === "string" ? value.argumentHint : "",
+      source: value.builtin === true ? "extension" : "skill",
+    };
+    const existing = byName.get(value.name);
+    if (!existing || value.builtin === true) byName.set(value.name, row);
+  }
+  return [...byName.values()];
+}
+
 type EventListener = (event: ClaudeAgentEvent) => void;
 type Lifecycle = "dormant" | "idle" | "running" | "awaiting-input" | "closing" | "closed";
 
@@ -164,6 +181,8 @@ export class ClaudeSessionWrapper {
   private activeStartedAt: number | null = null;
   private accumulatedActiveMs = 0;
   private latestResultUsage: Record<string, unknown> | undefined;
+  private selectedModel: string | undefined;
+  private selectedEffort: EffortLevel | undefined;
   private lastEventAt: number;
   private idleTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -173,11 +192,13 @@ export class ClaudeSessionWrapper {
     private readonly options: ClaudeRuntimeOptions,
     private readonly dependencies: ClaudeRuntimeDependencies = DEFAULT_DEPENDENCIES,
   ) {
-    if (options.modelId) throw new Error("Claude model is resolved by native settings; modelId is not accepted at session creation");
     this.nativeSessionId = nativeSessionId;
     this.sessionId = "claude:" + nativeSessionId;
     this.cwd = cwd;
     this.trusted = options.trustProject === true;
+    this.selectedModel = options.modelId;
+    this.selectedEffort = parseClaudeEffort(options.effort);
+    if (options.effort !== undefined && !this.selectedEffort) throw new Error("Unsupported Claude effort level");
     this.resumeOnNextStart = options.existing;
     this.lastEventAt = dependencies.now();
   }
@@ -312,7 +333,7 @@ export class ClaudeSessionWrapper {
       case "get_config":
         return this.dependencies.getConfiguration(this.cwd);
       case "set_model":
-        throw new ClaudeConflictError("Claude model is read from native settings and cannot be changed here");
+        return this.setModel(command);
       case "effort":
       case "set_effort":
         return this.setEffort(command);
@@ -331,6 +352,7 @@ export class ClaudeSessionWrapper {
   }
 
   private state(): Record<string, unknown> {
+    const activeModel = this.initialized?.model ?? this.selectedModel;
     return {
       sessionId: this.sessionId,
       backend: "claude",
@@ -339,9 +361,9 @@ export class ClaudeSessionWrapper {
       running: this.isRunning(),
       awaitingInput: this.isAwaitingInput(),
       subagentsActive: this.hasActiveSubagents(),
-      model: this.initialized ? { provider: "claude", id: this.initialized.model } : null,
-      thinkingLevel: this.initialized?.effort ?? this.options.effort ?? "native",
-      permissionMode: this.options.side ? "plan-locked-no-tools" : this.initialized?.permissionMode ?? this.options.permissionMode ?? "native",
+      model: activeModel ? { provider: "claude", id: activeModel } : null,
+      thinkingLevel: this.initialized?.effort ?? this.selectedEffort ?? "native",
+      permissionMode: this.options.side ? "plan-locked-no-tools" : this.initialized?.permissionMode ?? this.options.permissionMode ?? "bypassPermissions",
       queuedMessages: { steering: [], followUp: this.queuedFollowUps.map((row) => row.text) },
       pendingInteractions: [...this.pendingInteractions.values()].map((row) => row.request),
       backgroundTasks: [...this.backgroundTasks].map(([id, task]) => ({ id, ...task })),
@@ -367,34 +389,39 @@ export class ClaudeSessionWrapper {
   }
 
   private async commands(): Promise<Record<string, unknown>> {
-    if (!this.queryInstance) return { commands: [], available: false, reason: "session-not-started" };
+    if (!this.queryInstance) {
+      if (!this.trusted) return { commands: [], available: false, reason: "project-trust-required" };
+      await this.start();
+    }
     try {
-      return { commands: await this.queryInstance.supportedCommands(), available: true };
+      const commands = projectClaudeCommands(
+        await this.queryInstance!.supportedCommands(),
+        this.initialized?.terminal_slash_commands,
+      );
+      return { commands, available: true };
     } catch {
       throw new Error("Claude command catalogue is unavailable");
     }
   }
 
   private async models(): Promise<Record<string, unknown>> {
+    if (!this.queryInstance && this.trusted) await this.start();
     if (this.queryInstance) {
       try {
         const models = await this.queryInstance.supportedModels();
-        return { models: models.map(claudeModelRow), effectiveModel: this.initialized?.model ?? null, source: "live", complete: true };
+        return { models: models.map(claudeModelRow), effectiveModel: this.initialized?.model ?? this.selectedModel ?? null, source: "live", complete: true };
       } catch {
         throw new Error("Claude model catalogue is unavailable");
       }
     }
     const config = await this.dependencies.getConfiguration(this.cwd);
     const models = config.model ? [{ value: config.model, displayName: config.model }] : [];
-    return { models, effectiveModel: config.model, source: "settings", complete: false };
+    return { models, effectiveModel: this.selectedModel ?? config.model, source: "settings", complete: false };
   }
 
   private async prompt(command: Record<string, unknown>): Promise<Record<string, unknown>> {
     if (command.streamingBehavior === "steer") throw new ClaudeConflictError("Claude does not support Pi steer semantics; use follow_up");
     const promptText = stringField(command, "message")?.trim().toLowerCase() ?? "";
-    if (/^\/model(?:\s|$)/.test(promptText)) {
-      throw new ClaudeConflictError("Claude model is read from native settings and cannot be changed here");
-    }
     if (this.options.side && /^\/(?:permissions|allowed-tools|mcp|hooks)(?:\s|$)/.test(promptText)) {
       throw new ClaudeConflictError("Claude side-session security settings cannot be changed");
     }
@@ -450,8 +477,8 @@ export class ClaudeSessionWrapper {
         ? await this.dependencies.resolveExecutable(this.dependencies.env)
         : this.dependencies.executablePath ?? await resolveClaudeExecutable(this.dependencies.env);
       this.assertStartupActive();
-      const configuredEffort = parseClaudeEffort(this.options.effort);
-      const configuredPermission = this.options.side ? "plan" : parseClaudePermissionMode(this.options.permissionMode);
+      const configuredEffort = this.selectedEffort;
+      const configuredPermission = this.options.side ? "plan" : parseClaudePermissionMode(this.options.permissionMode) ?? "bypassPermissions";
       const sideCanUseTool: CanUseTool = (_toolName, _input, options) => Promise.resolve({
         behavior: "deny",
         message: "Side sessions cannot use tools",
@@ -472,8 +499,10 @@ export class ClaudeSessionWrapper {
           settingSources: ["user", "project", "local"],
           systemPrompt: { type: "preset", preset: "claude_code" },
           ...(this.resumeOnNextStart ? { resume: this.nativeSessionId } : { sessionId: this.nativeSessionId }),
+          ...(this.selectedModel ? { model: this.selectedModel } : {}),
           ...(configuredEffort ? { effort: configuredEffort } : {}),
-          ...(configuredPermission ? { permissionMode: configuredPermission } : {}),
+          permissionMode: configuredPermission,
+          ...(configuredPermission === "bypassPermissions" ? { allowDangerouslySkipPermissions: true } : {}),
           ...(this.options.side ? {
             tools: [],
             strictMcpConfig: true,
@@ -630,12 +659,39 @@ export class ClaudeSessionWrapper {
     return { stopped: true, stillQueued: result?.still_queued ?? [] };
   }
 
+  private async setModel(command: Record<string, unknown>): Promise<Record<string, unknown>> {
+    if (this.options.side) throw new ClaudeConflictError("Claude side-session model is locked");
+    const value = stringField(command, "modelId") ?? stringField(command, "model");
+    if (!value) throw new Error("Claude model is required");
+    if (this.queryInstance) {
+      try {
+        await this.queryInstance.setModel(value);
+      } catch {
+        throw new Error("Claude model could not be changed");
+      }
+    }
+    this.selectedModel = value;
+    if (this.initialized) this.initialized = { ...this.initialized, model: value };
+    return { provider: "claude", id: value };
+  }
+
   private async setEffort(command: Record<string, unknown>): Promise<Record<string, unknown>> {
-    if (!this.queryInstance) throw new ClaudeConflictError("Start the Claude session before changing effort");
+    if (command.effort === null || command.level === null) {
+      if (this.queryInstance) await this.queryInstance.applyFlagSettings({ effortLevel: null });
+      this.selectedEffort = undefined;
+      if (this.initialized) this.initialized = { ...this.initialized, effort: null };
+      return { effort: null };
+    }
     const value = parseClaudeEffort(command.effort ?? command.level);
     if (!value) throw new Error("Unsupported Claude effort level");
+    if (!this.queryInstance) {
+      this.selectedEffort = value;
+      return { effort: value };
+    }
     try {
       await this.queryInstance.applyFlagSettings({ effortLevel: value });
+      this.selectedEffort = value;
+      if (this.initialized) this.initialized = { ...this.initialized, effort: value };
       return { effort: value };
     } catch {
       throw new Error("Claude effort could not be changed");
@@ -706,7 +762,14 @@ export class ClaudeSessionWrapper {
   private consumeSystem(message: Extract<SDKMessage, { type: "system" }>): void {
     if (message.subtype === "init") {
       this.initialized = message;
+      this.selectedModel = message.model;
+      this.selectedEffort = parseClaudeEffort(message.effort) ?? this.selectedEffort;
       this.emit({ type: "claude_initialized", model: message.model, permissionMode: message.permissionMode, effort: message.effort });
+    } else if (message.subtype === "commands_changed") {
+      this.emit({
+        type: "claude_commands_changed",
+        commands: projectClaudeCommands(message.commands, this.initialized?.terminal_slash_commands),
+      });
     } else if (message.subtype === "session_state_changed") {
       if (message.state === "idle") {
         if (this.isStreaming) this.settleTurn(this.lastTurnAborted);

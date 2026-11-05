@@ -23,6 +23,8 @@ interface ModelSelectorProps {
   options: ModelSelectorOption[];
   value?: { provider: string; modelId: string } | null;
   onChange: (provider: string, modelId: string) => void;
+  /** Refreshes a lazy/native catalogue when the picker opens. */
+  onOpen?: () => void | Promise<void>;
   /** Live sessions can reapply saved metadata by choosing their current model again. */
   onReselect?: (provider: string, modelId: string) => void;
   onClear?: () => void;
@@ -46,15 +48,26 @@ interface ModelSelectorProps {
 
 const MODEL_FILTER_THRESHOLD = 8;
 
+function isSubsequence(needle: string, haystack: string): boolean {
+  let queryIndex = 0;
+  for (let index = 0; index < haystack.length && queryIndex < needle.length; index += 1) {
+    if (haystack[index] === needle[queryIndex]) queryIndex += 1;
+  }
+  return queryIndex === needle.length;
+}
+
 export function filterModelOptions(options: ModelSelectorOption[], query: string): ModelSelectorOption[] {
   const normalizedQuery = query.trim().toLocaleLowerCase();
   if (!normalizedQuery) return options;
 
-  return options.filter((option) => (
-    `${option.name} ${option.providerName ?? ""} ${option.modelId} ${option.provider}/${option.modelId}`
-      .toLocaleLowerCase()
-      .includes(normalizedQuery)
-  ));
+  const direct: ModelSelectorOption[] = [];
+  const fuzzy: ModelSelectorOption[] = [];
+  for (const option of options) {
+    const searchable = `${option.name} ${option.providerName ?? ""} ${option.modelId} ${option.provider}/${option.modelId}`.toLocaleLowerCase();
+    if (searchable.includes(normalizedQuery)) direct.push(option);
+    else if (isSubsequence(normalizedQuery, searchable)) fuzzy.push(option);
+  }
+  return [...direct, ...fuzzy];
 }
 
 /** Groups in first-appearance order; never re-sorts, so a models.json provider keeps its file's order (#783). */
@@ -82,6 +95,7 @@ export function ModelSelector({
   options,
   value,
   onChange,
+  onOpen,
   onReselect,
   onClear,
   emptyLabel,
@@ -217,6 +231,18 @@ export function ModelSelector({
     else onReselect?.(option.provider, option.modelId);
   };
 
+  const optionButtons = () => [...(panelRef.current?.querySelectorAll<HTMLButtonElement>("[role=option]") ?? [])];
+
+  const focusOption = (direction: 1 | -1) => {
+    const buttons = optionButtons();
+    if (!buttons.length) return;
+    const current = buttons.indexOf(document.activeElement as HTMLButtonElement);
+    const next = current < 0
+      ? (direction === 1 ? 0 : buttons.length - 1)
+      : (current + direction + buttons.length) % buttons.length;
+    buttons[next]?.focus();
+  };
+
   const saveDefault = (option: ModelSelectorOption) => {
     setOpen(false);
     setFilter("");
@@ -248,6 +274,7 @@ export function ModelSelector({
         onClick={(event) => {
           const rect = event.currentTarget.getBoundingClientRect();
           setAnchorRect({ top: rect.top, right: rect.right, bottom: rect.bottom, left: rect.left, width: rect.width });
+          if (!open) void onOpen?.();
           setOpen((current) => {
             if (current) setFilter("");
             else setShowAll(false);
@@ -317,6 +344,13 @@ export function ModelSelector({
             ref={panelRef}
             role="listbox"
             aria-label={ariaLabel}
+            onKeyDown={(event) => {
+              if (event.target instanceof HTMLInputElement) return;
+              if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+                event.preventDefault();
+                focusOption(event.key === "ArrowDown" ? 1 : -1);
+              }
+            }}
             style={{
               position: "fixed",
               ...verticalPosition,
@@ -363,9 +397,20 @@ export function ModelSelector({
                   value={filter}
                   onChange={(event) => setFilter(event.target.value)}
                   onKeyDown={(event) => {
-                    if (!onShowAll || event.key !== "Tab") return;
+                    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+                      event.preventDefault();
+                      focusOption(event.key === "ArrowDown" ? 1 : -1);
+                      return;
+                    }
+                    if (event.key === "Enter" && filteredOptions[0]) {
+                      event.preventDefault();
+                      choose(filteredOptions[0]);
+                      return;
+                    }
+                    if (event.key !== "Tab") return;
                     event.preventDefault();
-                    switchScope();
+                    if (onShowAll) switchScope();
+                    else if (filteredOptions[0]) choose(filteredOptions[0]);
                   }}
                   placeholder={t("chat.filterModels")}
                   aria-label={t("chat.filterModels")}

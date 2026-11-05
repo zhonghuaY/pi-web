@@ -144,7 +144,6 @@ export function createClaudeSession(cwd: string, options: ClaudeSessionCreateOpt
   if (process.env.PI_WEB_CLAUDE === "0") throw new ClaudeConflictError("Claude runtime is disabled");
   if (!isAbsolute(cwd)) throw new Error("Claude session cwd must be absolute");
   if (!options.requestId || !isNativeClaudeSessionId(options.requestId)) throw new Error("Claude creation requestId must be a UUID");
-  if (options.modelId) throw new Error("Claude model is resolved by native settings; modelId is not accepted at session creation");
   const requestId = options.requestId.toLowerCase();
   const priorRequest = registry().createRequests.get(requestId);
   if (priorRequest) {

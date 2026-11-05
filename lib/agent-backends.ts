@@ -3,6 +3,7 @@ export type AgentBackend = "pi" | "claude";
 export interface AgentCapabilities {
   fork: boolean; treeBranch: boolean; export: boolean; compact: boolean; mcp: boolean;
   side: boolean; steer: boolean; toolPresets: boolean; followUp: boolean;
+  commands: boolean; models: boolean; setModel: boolean; effort: boolean;
 }
 export interface ClaudeSettingSource { scope: "user" | "project" | "local"; path: string; exists: boolean }
 export interface ClaudeResourceStatus { status: string; count?: number }
@@ -18,7 +19,7 @@ export interface AgentBackendStatus {
 export interface AgentBackends { pi: AgentBackendStatus; claude: AgentBackendStatus }
 export interface AgentBackendScope { backend: AgentBackend; capabilities: AgentCapabilities; backends: AgentBackends }
 
-const CAPABILITY_KEYS: ReadonlyArray<keyof AgentCapabilities> = ["fork", "treeBranch", "export", "compact", "mcp", "side", "steer", "toolPresets", "followUp"];
+const CAPABILITY_KEYS: ReadonlyArray<keyof AgentCapabilities> = ["fork", "treeBranch", "export", "compact", "mcp", "side", "steer", "toolPresets", "followUp", "commands", "models", "setModel", "effort"];
 
 export function sameAgentCapabilities(left: AgentCapabilities, right: AgentCapabilities): boolean {
   return left === right || CAPABILITY_KEYS.every((key) => left[key] === right[key]);
@@ -44,8 +45,8 @@ export class StableRequestId {
   }
 }
 
-export const PI_CAPABILITIES: AgentCapabilities = Object.freeze({ fork: true, treeBranch: true, export: true, compact: true, mcp: true, side: true, steer: true, toolPresets: true, followUp: true });
-export const NO_CAPABILITIES: AgentCapabilities = Object.freeze({ fork: false, treeBranch: false, export: false, compact: false, mcp: false, side: false, steer: false, toolPresets: false, followUp: false });
+export const PI_CAPABILITIES: AgentCapabilities = Object.freeze({ fork: true, treeBranch: true, export: true, compact: true, mcp: true, side: true, steer: true, toolPresets: true, followUp: true, commands: true, models: true, setModel: true, effort: true });
+export const NO_CAPABILITIES: AgentCapabilities = Object.freeze({ fork: false, treeBranch: false, export: false, compact: false, mcp: false, side: false, steer: false, toolPresets: false, followUp: false, commands: false, models: false, setModel: false, effort: false });
 export const DEFAULT_AGENT_BACKENDS: AgentBackends = {
   pi: { backend: "pi", available: true, capabilities: PI_CAPABILITIES },
   claude: { backend: "claude", available: false, reason: "Claude Code is not available", capabilities: NO_CAPABILITIES,
@@ -59,7 +60,7 @@ function readCapabilities(value: unknown, fallback: AgentCapabilities): AgentCap
   const source = record(value);
   if (!source) return fallback;
   const yes = (key: keyof AgentCapabilities) => source[key] === true;
-  return { fork: yes("fork"), treeBranch: yes("treeBranch"), export: yes("export"), compact: yes("compact"), mcp: yes("mcp"), side: yes("side"), steer: yes("steer"), toolPresets: yes("toolPresets"), followUp: yes("followUp") };
+  return { fork: yes("fork"), treeBranch: yes("treeBranch"), export: yes("export"), compact: yes("compact"), mcp: yes("mcp"), side: yes("side"), steer: yes("steer"), toolPresets: yes("toolPresets"), followUp: yes("followUp"), commands: yes("commands"), models: yes("models"), setModel: yes("setModel"), effort: yes("effort") };
 }
 function parseClaudeConfiguration(value: unknown): ClaudeBackendConfiguration {
   const source = record(value) ?? {};
@@ -104,8 +105,8 @@ export async function fetchAgentBackends(cwd: string | null, signal?: AbortSigna
   if (!response.ok) throw new Error("HTTP " + response.status);
   return parseAgentBackends(await response.json());
 }
-export function canLoadAgentSlashCommands(backend: AgentBackend, sessionId: string | null): boolean {
-  return backend === "pi" || sessionId !== null;
+export function canLoadAgentSlashCommands(_backend: AgentBackend, _sessionId: string | null): boolean {
+  return true;
 }
 
 export function shouldHandleWebSlashCommand(backend: AgentBackend, commandName: string): boolean {

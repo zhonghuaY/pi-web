@@ -32,8 +32,16 @@ test("filters model options by model name, id, provider, and provider/id", () =>
   assert.deepEqual(filterModelOptions(options, "gpt-6"), [options[1]]);
   assert.deepEqual(filterModelOptions(options, "acme/custom"), [options[2]]);
   assert.deepEqual(filterModelOptions(options, "gateway"), [options[2]]);
+  assert.deepEqual(filterModelOptions(options, "g6ln"), [options[1]]);
   assert.deepEqual(filterModelOptions(options, "   "), options);
   assert.deepEqual(filterModelOptions(options, "nonexistent"), []);
+});
+
+test("ranks direct model matches ahead of weaker subsequence matches", () => {
+  const fuzzyEarlier = { provider: "claude", providerName: "Claude", modelId: "gpt-5.6-lucid-nova", name: "GPT 5.6 Lucid Nova" };
+  const directLater = { provider: "claude", providerName: "Claude", modelId: "codex/gpt-6-luna", name: "GPT-6 Luna" };
+
+  assert.deepEqual(filterModelOptions([fuzzyEarlier, directLater], "gpt-6-luna"), [directLater, fuzzyEarlier]);
 });
 
 test("groups models by provider and labels each group with the provider's display name", () => {

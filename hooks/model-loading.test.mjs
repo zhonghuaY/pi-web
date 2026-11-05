@@ -32,6 +32,14 @@ function script(text) {
 }
 const loadScript = script(`(${loader.initializer.arguments[0].getText(source)})`);
 const retryScript = script(retry.getText(source));
+const thinkingParser = nodes.find((node) => ts.isFunctionDeclaration(node) && node.name?.getText(source) === "asConcreteThinkingLevel");
+const parseConcreteThinkingLevel = script(`(${thinkingParser.getText(source)})`).runInNewContext({
+  CONCRETE_THINKING_LEVELS: new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]),
+});
+const historyThinkingSync = nodes.find((node) => ts.isIfStatement(node)
+  && node.expression.getText(source) === "!includeState"
+  && node.thenStatement.getText(source).includes("loadedThinkingLevel"));
+const historyThinkingSyncScript = script(historyThinkingSync.getText(source));
 
 function setup(fetchImpl) {
   const writes = [];
@@ -42,18 +50,43 @@ function setup(fetchImpl) {
     newSessionCwd: "/project", session: null, isNew: true, backend: "pi", backendRef: { current: "pi" },
     sessionIdRef: { current: null }, thinkingLevelOverrideRef: { current: null }, newSessionModelOverrideRef: { current: null },
     thinkingLevelPinsRef: { current: {} }, defaultThinkingLevelRef: { current: null }, allModelsLoadRef: { current: null },
-    asConcreteThinkingLevel: (value) => (!value || value === "auto" ? null : value),
+    claudeProjectTrustConfirmedRef: { current: false },
+    backends: { claude: { claude: { model: "sonnet" } } },
+    CLAUDE_EFFORT_LEVELS: ["low", "medium", "high", "xhigh", "max"],
+    CLAUDE_FALLBACK_MODELS: [{ id: "sonnet", name: "Sonnet" }, { id: "opus", name: "Opus" }, { id: "haiku", name: "Haiku" }],
+    sendAgentCommand() { throw new Error("untrusted Claude model discovery must stay dormant"); },
+    asConcreteThinkingLevel: parseConcreteThinkingLevel,
     fetch: fetchImpl,
     missingCwdFromBody, validatePiSessionChoices,
     MODELS_RETRY_DELAYS_MS: script(schedule.initializer.getText(source)).runInNewContext(),
     delay: async (ms) => { delays.push(ms); },
   };
-  for (const name of ["ModelError", "ModelsMissingCwd", "ModelNames", "ModelScopeWarnings", "IsModelScopeActive", "AllModelList", "ModelThinkingLevels", "ModelThinkingLevelMaps", "ModelList", "NewSessionDefaultModel", "NewSessionDefaultThinkingLevel", "SavedDefaultThinkingLevel", "NewSessionModel", "NewSessionThinkingLevel"]) {
+  for (const name of ["ModelError", "ModelsMissingCwd", "ModelNames", "ModelScopeWarnings", "IsModelScopeActive", "AllModelList", "ModelThinkingLevels", "ModelThinkingLevelMaps", "ModelList", "NewSessionDefaultModel", "NewSessionDefaultThinkingLevel", "SavedDefaultThinkingLevel", "NewSessionModel", "NewSessionThinkingLevel", "EffectiveNativeModel"]) {
     context[`set${name}`] = (value) => writes.push([name, value]);
   }
   context.loadModels = loadScript.runInNewContext(context);
   return { context, writes, delays, run: () => retryScript.runInNewContext(context) };
 }
+
+test("history placeholders do not erase a live Claude effort selection", () => {
+  assert.equal(parseConcreteThinkingLevel("native"), null);
+  assert.equal(parseConcreteThinkingLevel("auto"), null);
+  assert.equal(parseConcreteThinkingLevel("low"), "low");
+
+  const writes = [];
+  const context = {
+    includeState: false,
+    d: { context: { thinkingLevel: "native" } },
+    asConcreteThinkingLevel: parseConcreteThinkingLevel,
+    setLiveThinkingLevel: (value) => writes.push(value),
+  };
+
+  historyThinkingSyncScript.runInNewContext(context);
+  assert.deepEqual(writes, []);
+  context.d.context.thinkingLevel = "low";
+  historyThinkingSyncScript.runInNewContext(context);
+  assert.deepEqual(writes, ["low"]);
+});
 
 test("model-load failures stay visible through bounded retries and clear on recovery", async () => {
   for (const [fetchImpl, expected] of [
@@ -181,6 +214,30 @@ test("a picked model the folder offers keeps its pinned reasoning level; one it 
   started.context.newSessionModelOverrideRef.current = { provider: "other", modelId: "gone" };
   await started.run();
   assert.deepEqual(started.context.newSessionModelOverrideRef.current, { provider: "other", modelId: "gone" });
+});
+
+test("trusted Claude discovery keeps every native model once and honors effort capability", async () => {
+  const state = setup(async () => { throw new Error("Claude must not read the Pi model route"); });
+  state.context.backend = "claude";
+  state.context.backendRef.current = "claude";
+  state.context.sessionIdRef.current = "claude:session";
+  state.context.claudeProjectTrustConfirmedRef.current = true;
+  state.context.sendAgentCommand = async () => ({
+    effectiveModel: "custom-current",
+    models: [
+      { value: "fast", displayName: "Fast", supportsEffort: false, supportedEffortLevels: [] },
+      { value: "deep", displayName: "Deep", supportsEffort: true, supportedEffortLevels: ["high", "max"] },
+      { value: "deep", displayName: "Duplicate", supportsEffort: true, supportedEffortLevels: ["low"] },
+    ],
+  });
+
+  await state.context.loadModels();
+  const list = state.writes.findLast(([name]) => name === "ModelList")[1];
+  const levels = state.writes.findLast(([name]) => name === "ModelThinkingLevels")[1];
+  assert.deepEqual(Array.from(list, (model) => model.id), ["custom-current", "fast", "deep"]);
+  assert.deepEqual(Array.from(levels["claude:fast"]), []);
+  assert.deepEqual(Array.from(levels["claude:deep"]), ["high", "max"]);
+  assert.ok(state.writes.some(([name, value]) => name === "NewSessionDefaultModel" && value.modelId === "custom-current"));
 });
 
 test("returning from Claude to Pi reloads the cwd catalogue and rejects stale carried choices", async () => {

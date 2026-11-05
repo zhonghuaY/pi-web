@@ -310,7 +310,7 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
     dismissCompactError,
     handleRecallQueue,
     handleBuiltinSlashCommand,
-    handleToolPresetChange, handleThinkingLevelChange, handleSetDefaultModel, handleSetDefaultThinkingLevel, loadSlashCommands, loadAllModels, scrollUserMsgToTop,
+    handleToolPresetChange, handleThinkingLevelChange, handleSetDefaultModel, handleSetDefaultThinkingLevel, loadSlashCommands, loadModelsForPicker, loadAllModels, scrollUserMsgToTop,
     loadContext, activeLeafId, scrollToBottom, scrollToMessage,
   } = useAgentSession({
     session, sessionRunning, newSessionCwd, newSessionDraftKey, initialNewSessionChoices, onNewSessionChoicesChange, onBackendScopeChange, onAgentEnd: wrappedOnAgentEnd, onToolEnd, onAttentionNeeded, onSessionCreated, onSessionForked, onSideSession,
@@ -980,10 +980,11 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
       modelScopeWarnings={modelScopeWarnings}
       allModelList={allModelList}
       onLoadAllModels={backend === "pi" && isModelScopeActive ? loadAllModels : undefined}
-      onModelChange={backend === "pi" ? handleModelChange : undefined}
+      onLoadModels={capabilities.models ? loadModelsForPicker : undefined}
+      onModelChange={capabilities.setModel ? handleModelChange : undefined}
       modelSwitching={modelSwitching}
       defaultModel={defaultModel}
-      onSetDefaultModel={handleSetDefaultModel}
+      onSetDefaultModel={backend === "pi" ? handleSetDefaultModel : undefined}
       onCompact={capabilities.compact && (session || isNew) ? handleCompact : undefined}
       onAbortCompaction={handleAbortCompaction}
       isCompacting={isCompacting}
@@ -994,7 +995,7 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
       onToolPresetChange={capabilities.toolPresets && ((session && !isHiddenRelation(session.relation)) || isNew) ? handleToolPresetChange : undefined}
       thinkingLevel={thinkingLevel}
       isAutoThinkingSelection={isAutoThinkingSelection}
-      onThinkingLevelChange={backend === "pi" && (session || isNew) ? handleThinkingLevelChange : undefined}
+      onThinkingLevelChange={capabilities.effort && availableThinkingLevels?.length !== 0 && (session || isNew) ? handleThinkingLevelChange : undefined}
       availableThinkingLevels={availableThinkingLevels}
       thinkingLevelMap={currentThinkingLevelMap}
       savedDefaultThinkingLevel={savedDefaultThinkingLevel}
@@ -1005,7 +1006,7 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
       onRecallQueue={capabilities.steer || capabilities.followUp ? handleRecallQueue : undefined}
       slashCommands={slashCommands}
       slashCommandsLoading={slashCommandsLoading}
-      onLoadSlashCommands={backend === "pi" || session ? loadSlashCommands : undefined}
+      onLoadSlashCommands={capabilities.commands ? loadSlashCommands : undefined}
       onBuiltinCommand={handleBuiltinSlashCommand}
       soundEnabled={soundEnabled}
       onSoundToggle={onSoundToggle}

@@ -58,7 +58,7 @@ export function SelectorRow({
       }}
       style={{
         position: "relative",
-        background: active ? "var(--bg-selected)" : hovered ? "var(--bg-hover)" : "transparent",
+        background: active ? "var(--bg-selected)" : hovered || focused ? "var(--bg-hover)" : "transparent",
         transition: "background 0.1s",
       }}
     >

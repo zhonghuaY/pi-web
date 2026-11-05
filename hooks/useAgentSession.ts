@@ -271,6 +271,7 @@ export interface UseAgentSessionOptions {
 
 export type ThinkingLevelOption = "auto" | "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 type ConcreteThinkingLevel = Exclude<ThinkingLevelOption, "auto">;
+const CONCRETE_THINKING_LEVELS = new Set<ConcreteThinkingLevel>(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 
 /**
  * What a fresh composer was told to use instead of the automatic choice. The
@@ -285,8 +286,9 @@ export interface NewSessionChoices {
 }
 
 function asConcreteThinkingLevel(value?: string | null): ConcreteThinkingLevel | null {
-  if (!value || value === "auto") return null;
-  return value as ConcreteThinkingLevel;
+  return value && CONCRETE_THINKING_LEVELS.has(value as ConcreteThinkingLevel)
+    ? value as ConcreteThinkingLevel
+    : null;
 }
 
 // Session id -> user entry being edited. ChatWindow remounts per session, so a
@@ -444,6 +446,21 @@ type ModelsResponse = {
 type SlashCommandsResponse = {
   commands?: SlashCommandInfo[];
 };
+type ClaudeModelsResponse = {
+  models?: Array<{ value: string; displayName?: string; description?: string; supportsEffort?: boolean; supportedEffortLevels?: string[] }>;
+  effectiveModel?: string | null;
+  complete?: boolean;
+};
+type PendingClaudeTrustAction =
+  | { kind: "submission"; message: string; images?: AttachedImage[]; requestId: string }
+  | { kind: "discovery" };
+
+const CLAUDE_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
+const CLAUDE_FALLBACK_MODELS = [
+  { id: "sonnet", name: "Sonnet" },
+  { id: "opus", name: "Opus" },
+  { id: "haiku", name: "Haiku" },
+] as const;
 
 export function useAgentSession(opts: UseAgentSessionOptions) {
   const {
@@ -540,7 +557,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const [sessionStatsOverride, setSessionStatsOverride] = useState<SessionStatsInfo | null>(null);
   const [extensionDialogs, setExtensionDialogs] = useState<ExtensionUiDialogRequest[]>([]);
   const [agentInteractions, setAgentInteractions] = useState<PendingAgentInteraction[]>([]);
-  const [pendingClaudeTrustSubmission, setPendingClaudeTrustSubmission] = useState<{ message: string; images?: AttachedImage[]; requestId: string } | null>(null);
+  const [pendingClaudeTrustSubmission, setPendingClaudeTrustSubmission] = useState<PendingClaudeTrustAction | null>(null);
   const claudeProjectTrustConfirmedRef = useRef(false);
   const [extensionCustomUis, setExtensionCustomUis] = useState<ExtensionUiCustomRequest[]>([]);
   const [extensionStatuses, setExtensionStatuses] = useState<ExtensionStatusItem[]>([]);
@@ -712,6 +729,17 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const handleBackendChange = useCallback((next: AgentBackend) => {
     if (!isNew || sessionIdRef.current || !backends[next].available) return;
     backendRef.current = next;
+    if (next === "claude") {
+      if (newSessionModelOverrideRef.current?.provider !== "claude") {
+        newSessionModelOverrideRef.current = null;
+        setNewSessionModel(null);
+      }
+      const effort = thinkingLevelOverrideRef.current;
+      if (effort && !CLAUDE_EFFORT_LEVELS.includes(effort as typeof CLAUDE_EFFORT_LEVELS[number])) {
+        thinkingLevelOverrideRef.current = null;
+        setNewSessionThinkingLevel(null);
+      }
+    }
     setBackend(next);
   }, [backends, isNew]);
 
@@ -988,8 +1016,9 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         eventConnectionRef.current?.close("rebuilt");
         eventConnectionRef.current?.maintain(sid);
       }
-      if (!includeState && d.context.thinkingLevel && d.context.thinkingLevel !== "off") {
-        setLiveThinkingLevel(asConcreteThinkingLevel(d.context.thinkingLevel));
+      if (!includeState) {
+        const loadedThinkingLevel = asConcreteThinkingLevel(d.context.thinkingLevel);
+        if (loadedThinkingLevel) setLiveThinkingLevel(loadedThinkingLevel);
       }
 
       messagesLoaded = true;
@@ -1131,8 +1160,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       // Only send explicit user overrides. The server resolves the current
       // enabledModels scope atomically with AgentSession construction.
       const isPi = backendRef.current === "pi";
-      const selectedModel = isPi ? newSessionModelOverrideRef.current : null;
-      const selectedThinkingLevel = isPi ? thinkingLevelOverrideRef.current : null;
+      const selectedModel = newSessionModelOverrideRef.current;
+      const selectedThinkingLevel = thinkingLevelOverrideRef.current;
       if (selectedModel) setPendingModel(selectedModel);
       // Undefined means the user never overrode the loadout: omit the field entirely
       // so pi resolves settings.json defaultTools instead of being pinned to ours (#700).
@@ -1150,10 +1179,13 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
           type: "ensure_session",
           requestId,
           ...(toolNames !== undefined ? { toolNames } : {}),
-          ...(selectedModel ? { provider: selectedModel.provider, modelId: selectedModel.modelId } : {}),
-          ...(selectedThinkingLevel
+          ...(selectedModel ? (isPi
+            ? { provider: selectedModel.provider, modelId: selectedModel.modelId }
+            : { modelId: selectedModel.modelId }) : {}),
+          ...(selectedThinkingLevel ? (isPi
             ? { thinkingLevel: selectedThinkingLevel }
-            : {}),
+            : { effort: selectedThinkingLevel }) : {}),
+          ...(!isPi && claudeProjectTrustConfirmedRef.current ? { trustProject: true } : {}),
         }),
       });
       if (!res.ok) {
@@ -1168,21 +1200,21 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         sessionId: string;
         model?: SelectedModel | null;
         thinkingLevel?: ThinkingLevelOption;
+        state?: { model?: { provider?: string; id?: string } | null; thinkingLevel?: string };
       };
       const realId = result.sessionId;
       sessionIdRef.current = realId;
-      if (result.model && newSessionModelOverrideRef.current === selectedModel) {
-        setPendingModel(result.model);
-        if (!selectedModel) setNewSessionDefaultModel(result.model);
+      const resultModel = result.model ?? (result.state?.model?.id
+        ? { provider: result.state.model.provider ?? "claude", modelId: result.state.model.id }
+        : null);
+      const resultThinking = result.thinkingLevel ?? asConcreteThinkingLevel(result.state?.thinkingLevel);
+      if (resultModel && newSessionModelOverrideRef.current === selectedModel) {
+        setPendingModel(resultModel);
+        if (!selectedModel) setNewSessionDefaultModel(resultModel);
       }
-      if (
-        result.thinkingLevel
-        && thinkingLevelOverrideRef.current === selectedThinkingLevel
-      ) {
-        setLiveThinkingLevel(asConcreteThinkingLevel(result.thinkingLevel));
-        if (!selectedThinkingLevel) {
-          setNewSessionDefaultThinkingLevel(asConcreteThinkingLevel(result.thinkingLevel));
-        }
+      if (resultThinking && thinkingLevelOverrideRef.current === selectedThinkingLevel) {
+        setLiveThinkingLevel(asConcreteThinkingLevel(resultThinking));
+        if (!selectedThinkingLevel) setNewSessionDefaultThinkingLevel(asConcreteThinkingLevel(resultThinking));
       }
       return realId;
     })();
@@ -1229,20 +1261,27 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const requestSlashCommands = useCallback((): Promise<SlashCommandInfo[] | null> => {
     const existingSid = sessionIdRef.current;
     if (!canLoadAgentSlashCommands(backendRef.current, existingSid)) {
-      // A fresh Claude composer must not create even a dormant session just to
-      // populate completion. Existing dormant sessions answer safely.
       replaceSlashCommands([]);
       return Promise.resolve([]);
+    }
+    if (
+      backendRef.current === "claude"
+      && !claudeProjectTrustConfirmedRef.current
+      && requiresClaudeProjectTrust(isNew, runtimeRequiresProjectTrust, backends.claude.claude?.requiresProjectTrust)
+    ) {
+      setPendingClaudeTrustSubmission({ kind: "discovery" });
+      replaceSlashCommands([]);
+      return Promise.resolve(null);
     }
     const generation = ++slashCommandsGenerationRef.current;
     const current = () => slashCommandsGenerationRef.current === generation;
     const load = (async () => {
+      setSlashCommandsLoading(true);
       const sid = existingSid ?? await ensureNewSession();
       if (!sid) {
         if (current()) replaceSlashCommands([]);
         return [] as SlashCommandInfo[];
       }
-      setSlashCommandsLoading(true);
       try {
         const data = await sendAgentCommand<SlashCommandsResponse>(sid, { type: "get_commands" });
         const commands = data?.commands ?? [];
@@ -1263,7 +1302,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     };
     load.then(settle, settle);
     return load;
-  }, [ensureNewSession, replaceSlashCommands]);
+  }, [backends.claude.claude?.requiresProjectTrust, ensureNewSession, isNew, replaceSlashCommands, runtimeRequiresProjectTrust]);
 
   const loadSlashCommands = useCallback(async () => (await requestSlashCommands()) ?? [], [requestSlashCommands]);
 
@@ -2169,6 +2208,9 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       case "claude_initialized":
         if (typeof event.model === "string") setEffectiveNativeModel(event.model);
         break;
+      case "claude_commands_changed":
+        if (Array.isArray(event.commands)) replaceSlashCommands(event.commands as SlashCommandInfo[]);
+        break;
       case "agent_interaction_request":
         if (isAgentInteractionRequest(event)) {
           setAgentInteractions((queue) => upsertPendingAgentInteraction(queue, event));
@@ -2184,7 +2226,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         setExtensionDialogs((queue) => removeExtensionUiRequest(queue, event.id as string));
         break;
     }
-  }, [addNotice, applyLiveUsage, cancelEventStreamGrace, dispatch, handleExtensionUiRequest, loadSession, markPromptLanded, notifyPromptStage, onAgentEnd, onToolEnd, refreshContextUsage, scheduleEventStreamClose, scrollToBottom, settleUiStage, syncLiveModel]);
+  }, [addNotice, applyLiveUsage, cancelEventStreamGrace, dispatch, handleExtensionUiRequest, loadSession, markPromptLanded, notifyPromptStage, onAgentEnd, onToolEnd, refreshContextUsage, replaceSlashCommands, scheduleEventStreamClose, scrollToBottom, settleUiStage, syncLiveModel]);
   handleAgentEventRef.current = handleAgentEvent;
 
   const handleSend = useCallback(async (message: string, images?: AttachedImage[], existingRequestId?: string) => {
@@ -2204,7 +2246,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         status.claude?.requiresProjectTrust,
       );
       if (trustRequired && !claudeProjectTrustConfirmedRef.current) {
-        setPendingClaudeTrustSubmission({ message, images, requestId });
+        setPendingClaudeTrustSubmission({ kind: "submission", message, images, requestId });
         return;
       }
     }
@@ -2488,7 +2530,43 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   }, [capabilities.treeBranch, isCompacting, loadContext]);
 
   const handleModelChange = useCallback(async (provider: string, modelId: string) => {
-    if (backendRef.current !== "pi") return;
+    if (backendRef.current === "claude") {
+      const target = { provider: "claude", modelId };
+      if (isNew) {
+        newSessionModelOverrideRef.current = target;
+        setNewSessionModel(target);
+        setPendingModel(target);
+        const sid = sessionIdRef.current ?? await ensuringNewSessionRef.current;
+        if (!sid) return;
+        try {
+          await sendAgentCommand(sid, { type: "set_model", modelId });
+          setEffectiveNativeModel(modelId);
+        } catch (e) {
+          addNotice({ type: "error", message: `Failed to switch model: ${e instanceof Error ? e.message : String(e)}` });
+        }
+        return;
+      }
+      const sid = sessionIdRef.current;
+      if (!sid || modelSwitchPendingRef.current) return;
+      const previousOverride = currentModelOverride;
+      modelSwitchPendingRef.current = true;
+      setCurrentModelOverride(target);
+      setModelSwitching(true);
+      try {
+        const selected = await sendAgentCommand<{ provider: string; id: string }>(sid, { type: "set_model", modelId });
+        const live = { provider: selected.provider, modelId: selected.id };
+        setLiveModel(live);
+        setEffectiveNativeModel(selected.id);
+        setCurrentModelOverride(null);
+      } catch (e) {
+        setCurrentModelOverride(previousOverride);
+        addNotice({ type: "error", message: `Failed to switch model: ${e instanceof Error ? e.message : String(e)}` });
+      } finally {
+        modelSwitchPendingRef.current = false;
+        setModelSwitching(false);
+      }
+      return;
+    }
     if (isNew) {
       const selectedModel = { provider, modelId };
       newSessionModelOverrideRef.current = selectedModel;
@@ -2596,8 +2674,83 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const dismissCompactError = useCallback(() => setCompactError(null), []);
 
   const loadModels = useCallback(async (signal?: AbortSignal) => {
-    if (backend !== "pi") {
-      setModelList([]); setModelNames({}); setModelError(null); setModelScopeWarnings([]);
+    if (backend === "claude") {
+      setModelError(null);
+      setModelsMissingCwd(null);
+      setModelScopeWarnings([]);
+      setIsModelScopeActive(false);
+      setAllModelList(null);
+      allModelsLoadRef.current = null;
+
+      const configuredModel = backends.claude.claude?.model;
+      const picked = newSessionModelOverrideRef.current;
+      const fallbackIds = [configuredModel, picked?.provider === "claude" ? picked.modelId : null, ...CLAUDE_FALLBACK_MODELS.map((model) => model.id)]
+        .filter((value): value is string => Boolean(value));
+      let effectiveModel = configuredModel ?? null;
+      let rows = [...new Set(fallbackIds)].map((id) => ({
+        id,
+        name: CLAUDE_FALLBACK_MODELS.find((model) => model.id === id)?.name ?? id,
+        provider: "claude",
+        providerName: "Claude",
+        supportedEffortLevels: [...CLAUDE_EFFORT_LEVELS] as string[],
+      }));
+
+      const sid = sessionIdRef.current;
+      if (sid && claudeProjectTrustConfirmedRef.current) {
+        const live = await sendAgentCommand<ClaudeModelsResponse>(sid, { type: "get_models" });
+        signal?.throwIfAborted();
+        effectiveModel = live.effectiveModel ?? effectiveModel;
+        if (live.models?.length) {
+          const nativeRows = new Map<string, typeof rows[number]>();
+          for (const model of live.models) {
+            if (nativeRows.has(model.value)) continue;
+            nativeRows.set(model.value, {
+              id: model.value,
+              name: model.displayName ?? model.value,
+              provider: "claude",
+              providerName: "Claude",
+              supportedEffortLevels: model.supportsEffort === false
+                ? []
+                : model.supportedEffortLevels?.length
+                  ? model.supportedEffortLevels
+                  : [...CLAUDE_EFFORT_LEVELS],
+            });
+          }
+          rows = [...nativeRows.values()];
+          if (effectiveModel && !nativeRows.has(effectiveModel)) {
+            rows.unshift({
+              id: effectiveModel,
+              name: effectiveModel,
+              provider: "claude",
+              providerName: "Claude",
+              supportedEffortLevels: [...CLAUDE_EFFORT_LEVELS],
+            });
+          }
+        }
+      }
+      signal?.throwIfAborted();
+      const modelList = rows.map(({ supportedEffortLevels: _levels, ...model }) => model);
+      setModelList(modelList);
+      setModelNames(Object.fromEntries(modelList.map((model) => ["claude:" + model.id, model.name])));
+      setModelThinkingLevels(Object.fromEntries(rows.map((model) => ["claude:" + model.id, model.supportedEffortLevels])));
+      setModelThinkingLevelMaps({});
+      if (effectiveModel) {
+        setEffectiveNativeModel(effectiveModel);
+        setNewSessionDefaultModel({ provider: "claude", modelId: effectiveModel });
+      } else {
+        setNewSessionDefaultModel(null);
+      }
+      setNewSessionDefaultThinkingLevel(null);
+      setSavedDefaultThinkingLevel(null);
+      if (isNew && picked && picked.provider !== "claude") {
+        newSessionModelOverrideRef.current = null;
+        setNewSessionModel(null);
+      }
+      const pickedEffort = thinkingLevelOverrideRef.current;
+      if (isNew && pickedEffort && !CLAUDE_EFFORT_LEVELS.includes(pickedEffort as typeof CLAUDE_EFFORT_LEVELS[number])) {
+        thinkingLevelOverrideRef.current = null;
+        setNewSessionThinkingLevel(null);
+      }
       return;
     }
     const modelCwd = newSessionCwd ?? session?.cwd ?? "";
@@ -2686,7 +2839,19 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         );
       }
     }
-  }, [backend, isNew, newSessionCwd, session?.cwd]);
+  }, [backend, backends.claude.claude?.model, isNew, newSessionCwd, session?.cwd]);
+
+  const loadModelsForPicker = useCallback(async () => {
+    if (
+      backendRef.current === "claude"
+      && !claudeProjectTrustConfirmedRef.current
+      && requiresClaudeProjectTrust(isNew, runtimeRequiresProjectTrust, backends.claude.claude?.requiresProjectTrust)
+    ) {
+      setPendingClaudeTrustSubmission({ kind: "discovery" });
+      return;
+    }
+    await loadModels();
+  }, [backends.claude.claude?.requiresProjectTrust, isNew, loadModels, runtimeRequiresProjectTrust]);
 
   // pi's /model "all" scope: names and reasoning levels of models outside
   // `enabledModels` join the maps, so a picked unscoped model shows them too.
@@ -3034,6 +3199,15 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       thinkingLevelOverrideRef.current = null;
       setNewSessionThinkingLevel(null);
       setCurrentThinkingOverride(null);
+      const sid = sessionIdRef.current;
+      if (backendRef.current === "claude" && sid) {
+        try {
+          await sendAgentCommand(sid, { type: "set_effort", effort: null });
+          setLiveThinkingLevel(null);
+        } catch (e) {
+          console.error("Failed to reset Claude effort:", e);
+        }
+      }
       return;
     }
     if (isNew) {
@@ -3045,7 +3219,9 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     const sid = sessionIdRef.current ?? await ensuringNewSessionRef.current;
     if (!sid) return;
     try {
-      await sendAgentCommand(sid, { type: "set_thinking_level", level });
+      await sendAgentCommand(sid, backendRef.current === "claude"
+        ? { type: "set_effort", effort: level }
+        : { type: "set_thinking_level", level });
       if (sessionHookMountedRef.current && sessionIdRef.current === sid) {
         setLiveThinkingLevel(level);
         setCurrentThinkingOverride(null);
@@ -3552,13 +3728,20 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     if (!pending) return;
     claudeProjectTrustConfirmedRef.current = true;
     setPendingClaudeTrustSubmission(null);
-    void handleSendRef.current?.(pending.message, pending.images, pending.requestId);
-  }, [pendingClaudeTrustSubmission]);
+    if (pending.kind === "submission") {
+      void handleSendRef.current?.(pending.message, pending.images, pending.requestId);
+      return;
+    }
+    void (async () => {
+      await requestSlashCommands();
+      await loadModels();
+    })();
+  }, [loadModels, pendingClaudeTrustSubmission, requestSlashCommands]);
   const cancelClaudeProjectTrust = useCallback(() => {
     const pending = pendingClaudeTrustSubmission;
     if (!pending) return;
     setPendingClaudeTrustSubmission(null);
-    restoreSubmission(pending.message, pending.images, composerDraftKey);
+    if (pending.kind === "submission") restoreSubmission(pending.message, pending.images, composerDraftKey);
   }, [composerDraftKey, pendingClaudeTrustSubmission, restoreSubmission]);
 
   const thinkingLevel: ThinkingLevelOption = displayThinkingLevel ?? "auto";
@@ -3607,7 +3790,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     cancelEdit: editEntryId ? cancelEdit : undefined,
     addNotice,
     setNoticePaused: setPausedNoticeId,
-    handleToolPresetChange, handleThinkingLevelChange, handleSetDefaultModel, handleSetDefaultThinkingLevel, loadTools, loadSlashCommands, loadAllModels, setActiveLeafId, setData, setMessages, loadContext,
+    handleToolPresetChange, handleThinkingLevelChange, handleSetDefaultModel, handleSetDefaultThinkingLevel, loadTools, loadSlashCommands, loadModelsForPicker, loadAllModels, setActiveLeafId, setData, setMessages, loadContext,
     scrollToBottom, scrollUserMsgToTop, scrollToMessage,
     dispatch, setAgentRunning, setForkingEntryId,
     bashRunning, pendingBash,

@@ -703,6 +703,21 @@ test("backend discovery errors are visible with a retry action", () => {
   assert.match(html, />Retry<\/button>/);
 });
 
+test("Claude composer exposes native model and effort selectors", () => {
+  const html = renderToStaticMarkup(
+    React.createElement(I18nProvider, null, React.createElement(ChatInput, {
+      onSend() {}, onAbort() {}, isStreaming: false, backend: "claude",
+      model: { provider: "claude", modelId: "sonnet" },
+      modelList: [{ provider: "claude", id: "sonnet", name: "Sonnet", providerName: "Claude" }],
+      onModelChange() {}, thinkingLevel: "high", availableThinkingLevels: ["low", "medium", "high"], onThinkingLevelChange() {},
+    })),
+  );
+  assert.match(html, /aria-label="Change model"/);
+  assert.match(html, /aria-label="Change reasoning level"/);
+  assert.match(html, />Sonnet</);
+  assert.match(html, />high</);
+});
+
 test("recognizes exact slash commands for one-Enter submission", () => {
   const builtin = { name: "copy", description: "", source: "builtin" };
   assert.equal(isExactSlashCommand("/copy", builtin), true);

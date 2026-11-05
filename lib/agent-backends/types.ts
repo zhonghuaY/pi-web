@@ -78,7 +78,7 @@ export const CLAUDE_CAPABILITIES: Readonly<AgentBackendCapabilities> = Object.fr
   tools: true,
   commands: true,
   models: true,
-  setModel: false,
+  setModel: true,
   effort: true,
   permissionMode: true,
   subagents: "display",

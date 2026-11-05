@@ -79,6 +79,7 @@ interface Props {
   allModelList?: { id: string; name: string; provider: string; providerName?: string }[] | null;
   /** Set only while `enabledModels` narrows the list: loads `allModelList`. */
   onLoadAllModels?: () => void;
+  onLoadModels?: () => void | Promise<void>;
   onModelChange?: (provider: string, modelId: string) => void;
   modelSwitching?: boolean;
   /** The model new sessions start with, starred in the model selector. */
@@ -719,7 +720,7 @@ export function ModelScopeWarningBanner({ warnings }: { warnings?: string[] }) {
 // Memoized: its props hold still while a reply streams or a tool runs, and the
 // chat around it re-renders through both.
 export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatInput({
-  onSend, onAbort, onSteer, onSideChat, onFollowUp, isStreaming, backend = "pi", backends, backendsLoading = false, backendsError, onRetryBackends, capabilities, onBackendChange, effectiveNativeModel, shellCommandsEnabled = true, model, isAutoModelSelection, modelNames, modelList, modelError, missingCwd, modelScopeWarnings, allModelList, onLoadAllModels, onModelChange, modelSwitching,
+  onSend, onAbort, onSteer, onSideChat, onFollowUp, isStreaming, backend = "pi", backends, backendsLoading = false, backendsError, onRetryBackends, capabilities, onBackendChange, effectiveNativeModel, shellCommandsEnabled = true, model, isAutoModelSelection, modelNames, modelList, modelError, missingCwd, modelScopeWarnings, allModelList, onLoadAllModels, onLoadModels, onModelChange, modelSwitching,
   defaultModel, onSetDefaultModel,
   onCompact, onAbortCompaction, isCompacting, compactError, onDismissCompactError, compactResult, toolPreset, onToolPresetChange,
   thinkingLevel, isAutoThinkingSelection = false, onThinkingLevelChange, availableThinkingLevels, thinkingLevelMap,
@@ -2598,18 +2599,19 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
                 {backend === "claude" ? "Claude" : "Pi"}
               </span>
             )}
-            {backend === "claude" && (
+            {backend === "claude" && !onModelChange && (
               <span title={t("chat.nativeModelHelp")} style={{ maxWidth: 220, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--text-muted)", fontSize: 11 }}>
                 {effectiveNativeModel ?? t("chat.nativeModelUnresolved")}
               </span>
             )}
-            {/* Pi model selector; the Claude native settings model is read-only above. */}
-            {backend === "pi" && (modelOptions.length > 0 || model || modelError) && onModelChange && (
+            {(modelOptions.length > 0 || model || modelError) && onModelChange && (
               <ModelSelector
                 options={modelOptions}
                 value={model}
+                onOpen={onLoadModels}
                 onChange={onModelChange}
                 onReselect={onModelChange}
+                ariaLabel={t("chat.changeModel")}
                 busy={modelSwitching}
                 isAutoSelection={isAutoModelSelection}
                 defaultValue={defaultModel}
