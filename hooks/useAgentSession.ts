@@ -319,9 +319,14 @@ const MODELS_RETRY_DELAYS_MS = [2_000, 5_000, 10_000];
 const MAX_NOTICES = 5;
 const NOTICE_VISIBLE_MS = 5000;
 const NOTICE_EXIT_ANIMATION_MS = 180;
-function createRequestId(): string {
-  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") return crypto.randomUUID();
-  return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+export function createRequestId(): string {
+  if (typeof crypto.randomUUID === "function") return crypto.randomUUID();
+  // randomUUID requires a secure context; getRandomValues also works on LAN HTTP.
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
 function createNoticeId(): string {
@@ -1650,7 +1655,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     }
     let identity = handoffRequestRef.current;
     if (!identity || identity.sourceSessionId !== sourceSessionId || identity.targetBackend !== targetBackend) {
-      identity = { sourceSessionId, targetBackend, requestId: crypto.randomUUID() };
+      identity = { sourceSessionId, targetBackend, requestId: createRequestId() };
       handoffRequestRef.current = identity;
     }
     if (targetBackend === "claude" && !claudeProjectTrustConfirmedRef.current) {
