@@ -242,6 +242,8 @@ export interface UseAgentSessionOptions {
   onToolEnd?: (toolName: string) => void;
   onAttentionNeeded?: (request: BlockingExtensionUiRequest) => void;
   onSessionCreated?: (session: SessionInfo, sourceDraftKey: string) => void;
+  /** A cross-backend handoff created a new native target session. */
+  onSessionHandoff?: (sourceSessionId: string, target: SessionInfo) => void;
   onSessionForked?: (newSessionId: string) => void;
   /** `/side`: a side chat was forked from this session; open its tab. The
    *  prompt argument, if any, seeds the new chat's composer. */
@@ -453,7 +455,64 @@ type ClaudeModelsResponse = {
 };
 type PendingClaudeTrustAction =
   | { kind: "submission"; message: string; images?: AttachedImage[]; requestId: string }
-  | { kind: "discovery" };
+  | { kind: "discovery" }
+  | { kind: "handoff"; targetBackend: AgentBackend; requestId: string };
+
+type HandoffRequestIdentity = { sourceSessionId: string; targetBackend: AgentBackend; requestId: string };
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+export function handoffSessionFromResponse(value: unknown): SessionInfo | null {
+  if (!isRecord(value) || !isRecord(value.data) || !isRecord(value.data.session)) return null;
+  const session = value.data.session;
+  if (typeof session.id !== "string" || typeof session.cwd !== "string"
+    || typeof session.path !== "string" || typeof session.created !== "string"
+    || typeof session.modified !== "string" || typeof session.firstMessage !== "string"
+    || typeof session.messageCount !== "number") return null;
+  const backend = session.backend === "pi" || session.backend === "claude" ? session.backend : undefined;
+  const relationSource = session.relation;
+  const relationBackend: AgentBackend | null = isRecord(relationSource)
+    && (relationSource.sourceBackend === "pi" || relationSource.sourceBackend === "claude")
+    ? relationSource.sourceBackend
+    : null;
+  const relation = isRecord(relationSource)
+    && relationSource.kind === "handoff"
+    && typeof relationSource.sourceSessionId === "string"
+    && relationBackend !== null
+    && typeof relationSource.requestId === "string"
+    && (relationSource.sourceEntryId === undefined || typeof relationSource.sourceEntryId === "string")
+    ? {
+        kind: "handoff" as const,
+        sourceSessionId: relationSource.sourceSessionId,
+        sourceBackend: relationBackend,
+        ...(typeof relationSource.sourceEntryId === "string" ? { sourceEntryId: relationSource.sourceEntryId } : {}),
+        requestId: relationSource.requestId,
+      }
+    : undefined;
+  return {
+    id: session.id,
+    cwd: session.cwd,
+    path: session.path,
+    created: session.created,
+    modified: session.modified,
+    firstMessage: session.firstMessage,
+    messageCount: session.messageCount,
+    ...(typeof session.name === "string" ? { name: session.name } : {}),
+    ...(backend ? { backend } : {}),
+    ...(typeof session.projectRoot === "string" ? { projectRoot: session.projectRoot } : {}),
+    ...(typeof session.projectKey === "string" ? { projectKey: session.projectKey } : {}),
+    ...(typeof session.branch === "string" ? { branch: session.branch } : {}),
+    ...(session.isWorktree === true ? { isWorktree: true } : {}),
+    ...(session.transient === true ? { transient: true } : {}),
+    ...(relation ? { relation } : {}),
+  };
+}
+
+function handoffErrorFromResponse(value: unknown, fallback: string): string {
+  return isRecord(value) && typeof value.error === "string" ? value.error : fallback;
+}
 
 const CLAUDE_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
 const CLAUDE_FALLBACK_MODELS = [
@@ -464,7 +523,7 @@ const CLAUDE_FALLBACK_MODELS = [
 
 export function useAgentSession(opts: UseAgentSessionOptions) {
   const {
-    session, newSessionCwd, newSessionDraftKey, onAgentEnd, onToolEnd, onAttentionNeeded, onSessionCreated, onSessionForked, onSideSession,
+    session, newSessionCwd, newSessionDraftKey, onAgentEnd, onToolEnd, onAttentionNeeded, onSessionCreated, onSessionHandoff, onSessionForked, onSideSession,
     modelsRefreshKey, onBranchDataChange, onSystemPromptChange, onSystemToolsChange, onSystemInfoLoaderChange, onSessionStatsPanelOpen,
     onOpenSettings, onDebugSnapshotReaderChange, onBackendScopeChange,
   } = opts;
@@ -558,6 +617,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const [extensionDialogs, setExtensionDialogs] = useState<ExtensionUiDialogRequest[]>([]);
   const [agentInteractions, setAgentInteractions] = useState<PendingAgentInteraction[]>([]);
   const [pendingClaudeTrustSubmission, setPendingClaudeTrustSubmission] = useState<PendingClaudeTrustAction | null>(null);
+  const [handoffSwitching, setHandoffSwitching] = useState(false);
+  const handoffRequestRef = useRef<HandoffRequestIdentity | null>(null);
   const claudeProjectTrustConfirmedRef = useRef(false);
   const [extensionCustomUis, setExtensionCustomUis] = useState<ExtensionUiCustomRequest[]>([]);
   const [extensionStatuses, setExtensionStatuses] = useState<ExtensionStatusItem[]>([]);
@@ -1534,6 +1595,70 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const translateRef = useRef(opts.t);
   translateRef.current = opts.t;
   const translate = useCallback((key: string, params?: TranslationParams) => translateRef.current(key, params), []);
+
+  const startSessionHandoff = useCallback(async (targetBackend: AgentBackend, requestId: string, trustProject: boolean) => {
+    const sourceSessionId = sessionIdRef.current;
+    if (!session || sourceSessionId !== session.id || handoffSwitching) return;
+    setHandoffSwitching(true);
+    try {
+      const response = await fetch("/api/sessions/" + encodeURIComponent(sourceSessionId) + "/handoff", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ targetBackend, requestId, ...(trustProject ? { trustProject: true } : {}) }),
+      });
+      const body: unknown = await response.json().catch(() => null);
+      if (!response.ok) throw new Error(handoffErrorFromResponse(body, "HTTP " + response.status));
+      const target = handoffSessionFromResponse(body);
+      if (!target || (target.backend !== undefined && target.backend !== targetBackend)) {
+        throw new Error("Invalid handoff response");
+      }
+      handoffRequestRef.current = null;
+      if (sessionHookMountedRef.current && sessionIdRef.current === sourceSessionId) {
+        onSessionHandoff?.(sourceSessionId, {
+          ...target,
+          backend: targetBackend,
+          capabilities: backends[targetBackend].capabilities,
+          relation: target.relation ?? {
+            kind: "handoff",
+            sourceSessionId,
+            sourceBackend: backendRef.current,
+            requestId,
+          },
+        });
+      }
+    } catch (error) {
+      if (sessionHookMountedRef.current && sessionIdRef.current === sourceSessionId) {
+        addNotice({
+          type: "error",
+          message: translate("chat.handoffFailed", {
+            backend: targetBackend === "claude" ? "Claude" : "Pi",
+            error: error instanceof Error ? error.message : String(error),
+          }),
+        });
+      }
+    } finally {
+      if (sessionHookMountedRef.current) setHandoffSwitching(false);
+    }
+  }, [addNotice, backends, handoffSwitching, onSessionHandoff, session, translate]);
+
+  const handleSessionHandoff = useCallback((targetBackend: AgentBackend) => {
+    const sourceSessionId = sessionIdRef.current;
+    if (!session || sourceSessionId !== session.id || targetBackend === backendRef.current || handoffSwitching) return;
+    if (!backends[targetBackend].available) {
+      addNotice({ type: "error", message: backends[targetBackend].reason ?? translate("chat.backendUnavailable") });
+      return;
+    }
+    let identity = handoffRequestRef.current;
+    if (!identity || identity.sourceSessionId !== sourceSessionId || identity.targetBackend !== targetBackend) {
+      identity = { sourceSessionId, targetBackend, requestId: crypto.randomUUID() };
+      handoffRequestRef.current = identity;
+    }
+    if (targetBackend === "claude" && !claudeProjectTrustConfirmedRef.current) {
+      setPendingClaudeTrustSubmission({ kind: "handoff", targetBackend, requestId: identity.requestId });
+      return;
+    }
+    void startSessionHandoff(targetBackend, identity.requestId, targetBackend === "claude");
+  }, [addNotice, backends, handoffSwitching, session, startSessionHandoff, translate]);
   // A steer or follow-up whose request failed without the server's refusal (the
   // network dropped, a proxy answered) may still have been accepted. Its text
   // goes back to the composer all the same (restoreSubmission merges it in front
@@ -3732,11 +3857,15 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       void handleSendRef.current?.(pending.message, pending.images, pending.requestId);
       return;
     }
+    if (pending.kind === "handoff") {
+      void startSessionHandoff(pending.targetBackend, pending.requestId, true);
+      return;
+    }
     void (async () => {
       await requestSlashCommands();
       await loadModels();
     })();
-  }, [loadModels, pendingClaudeTrustSubmission, requestSlashCommands]);
+  }, [loadModels, pendingClaudeTrustSubmission, requestSlashCommands, startSessionHandoff]);
   const cancelClaudeProjectTrust = useCallback(() => {
     const pending = pendingClaudeTrustSubmission;
     if (!pending) return;
@@ -3758,7 +3887,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   return {
     // State
     data, loading, error, activeLeafId, messages, activeToolResults, entryIds, messageKeys, historyCursor, hasEarlierMessages, earlierTurnCount, streamingStore,
-    backend, backends, backendsLoading, backendsError, retryBackendDiscovery, capabilities, handleBackendChange,
+    backend, backends, backendsLoading, backendsError, retryBackendDiscovery, capabilities, handleBackendChange, handleSessionHandoff, handoffSwitching,
     effectiveNativeModel: effectiveNativeModel ?? data?.effectiveModel ?? backends.claude.claude?.model ?? null,
     agentInteraction: agentInteractions[0] ?? null, waitingAgentInteractionCount: Math.max(0, agentInteractions.length - 1), respondToAgentInteraction,
     pendingClaudeTrustSubmission, confirmClaudeProjectTrust, cancelClaudeProjectTrust,

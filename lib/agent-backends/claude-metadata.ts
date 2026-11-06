@@ -18,10 +18,20 @@ export interface PendingClaudeSideFork {
   createdAt: string;
 }
 
+export interface ClaudeHandoffMetadataEntry {
+  sourceSessionId: string;
+  sourceBackend: "pi" | "claude";
+  sourceEntryId?: string;
+  requestId: string;
+  title: string;
+  createdAt: string;
+}
+
 export interface ClaudeWebMetadataFile {
   version: 1;
   sessions: Record<string, ClaudeWebMetadataEntry>;
   pendingSideForks: Record<string, PendingClaudeSideFork>;
+  handoffs: Record<string, ClaudeHandoffMetadataEntry>;
 }
 
 let serializedWrite = Promise.resolve();
@@ -32,7 +42,7 @@ export function claudeMetadataPath(env: NodeJS.ProcessEnv = process.env): string
 }
 
 function empty(): ClaudeWebMetadataFile {
-  return { version: 1, sessions: {}, pendingSideForks: {} };
+  return { version: 1, sessions: {}, pendingSideForks: {}, handoffs: {} };
 }
 
 export async function readClaudeWebMetadata(path = claudeMetadataPath()): Promise<ClaudeWebMetadataFile> {
@@ -52,6 +62,29 @@ export async function readClaudeWebMetadata(path = claudeMetadataPath()): Promis
       }
       sessions[id.toLowerCase()] = { parentSessionId: row.parentSessionId!, policy: row.policy, createdAt: row.createdAt };
     }
+    const handoffSource = (parsed as { handoffs?: unknown }).handoffs ?? {};
+    if (!handoffSource || typeof handoffSource !== "object") throw new Error("invalid handoffs");
+    const handoffs: Record<string, ClaudeHandoffMetadataEntry> = {};
+    for (const [id, value] of Object.entries(handoffSource)) {
+      if (!isNativeClaudeSessionId(id) || !value || typeof value !== "object") throw new Error("invalid handoff row");
+      const row = value as Partial<ClaudeHandoffMetadataEntry>;
+      if (typeof row.sourceSessionId !== "string" || row.sourceSessionId.length === 0 || row.sourceSessionId.length > 200
+        || (row.sourceBackend !== "pi" && row.sourceBackend !== "claude")
+        || (row.sourceEntryId !== undefined && (typeof row.sourceEntryId !== "string" || row.sourceEntryId.length > 200))
+        || typeof row.requestId !== "string" || !isNativeClaudeSessionId(row.requestId)
+        || typeof row.title !== "string" || row.title.length > 500
+        || typeof row.createdAt !== "string") {
+        throw new Error("invalid handoff row");
+      }
+      handoffs[id.toLowerCase()] = {
+        sourceSessionId: row.sourceSessionId,
+        sourceBackend: row.sourceBackend,
+        ...(row.sourceEntryId ? { sourceEntryId: row.sourceEntryId } : {}),
+        requestId: row.requestId.toLowerCase(),
+        title: row.title,
+        createdAt: row.createdAt,
+      };
+    }
     const pendingSource = (parsed as { pendingSideForks?: unknown }).pendingSideForks ?? {};
     if (!pendingSource || typeof pendingSource !== "object") throw new Error("invalid pending side forks");
     const pendingSideForks: Record<string, PendingClaudeSideFork> = {};
@@ -69,7 +102,7 @@ export async function readClaudeWebMetadata(path = claudeMetadataPath()): Promis
         createdAt: row.createdAt,
       };
     }
-    return { version: 1, sessions, pendingSideForks };
+    return { version: 1, sessions, pendingSideForks, handoffs };
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return empty();
     throw new Error("Claude Web metadata could not be loaded");
@@ -160,8 +193,38 @@ export function claudeSidePolicy(
   return undefined;
 }
 
+export function recordClaudeHandoff(
+  nativeId: string,
+  entry: Omit<ClaudeHandoffMetadataEntry, "createdAt">,
+  path = claudeMetadataPath(),
+): Promise<void> {
+  if (!isNativeClaudeSessionId(nativeId)
+    || typeof entry.sourceSessionId !== "string" || entry.sourceSessionId.length === 0 || entry.sourceSessionId.length > 200
+    || (entry.sourceBackend !== "pi" && entry.sourceBackend !== "claude")
+    || (entry.sourceEntryId !== undefined && (typeof entry.sourceEntryId !== "string" || entry.sourceEntryId.length > 200))
+    || !isNativeClaudeSessionId(entry.requestId)
+    || typeof entry.title !== "string" || entry.title.length > 500) {
+    throw new Error("Invalid Claude handoff metadata");
+  }
+  return mutate((file) => {
+    file.handoffs[nativeId.toLowerCase()] = {
+      ...entry,
+      requestId: entry.requestId.toLowerCase(),
+      createdAt: new Date().toISOString(),
+    };
+  }, path);
+}
+
+export function claudeHandoffMetadata(
+  nativeId: string,
+  metadata: ClaudeWebMetadataFile,
+): ClaudeHandoffMetadataEntry | undefined {
+  return metadata.handoffs[nativeId.toLowerCase()];
+}
+
 export function deleteClaudeWebMetadata(nativeId: string, path = claudeMetadataPath()): Promise<void> {
   return mutate((file) => {
     delete file.sessions[nativeId.toLowerCase()];
+    delete file.handoffs[nativeId.toLowerCase()];
   }, path);
 }

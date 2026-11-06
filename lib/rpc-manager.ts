@@ -18,6 +18,7 @@ import {
   preferUserBashExtension,
 } from "./project-command-env";
 import { cacheSessionPath, catalogFirstMessage, getLatestModelChange, invalidateSessionListCache, readLatestSessionEntryId, resolveSessionPath } from "./session-reader";
+import { sessionHandoffRelation } from "./session-handoff";
 import { computeLiveSessionTotalActiveMs } from "./session-timing";
 import { getProjectTrustStatus, projectTrustReloadOptions } from "./project-trust";
 import { notifySessionComplete } from "./web-push";
@@ -2824,6 +2825,8 @@ export function getRpcSessionInfos(options: { includeTransient?: boolean } = {})
     const persisted = Boolean(sessionFile && existsSync(sessionFile));
     const subagent = readSubagentRun(entries as unknown as SessionEntry[], header?.id ?? session.sessionId, sessionFile ?? "");
     const side = subagent ? null : readSideRelation(entries as unknown as SessionEntry[]);
+    const firstUserText = firstUserMessage ? runtimeMessageText(firstUserMessage) : "";
+    const handoff = sessionHandoffRelation(firstUserText);
 
     // An ensure_session call creates an idle, empty runtime while the composer
     // loads commands. Do not leak it into history before a prompt is accepted.
@@ -2847,7 +2850,7 @@ export function getRpcSessionInfos(options: { includeTransient?: boolean } = {})
       created,
       modified: new Date(lastActivityMs).toISOString(),
       messageCount: messages.length,
-      firstMessage: catalogFirstMessage(firstUserMessage ? runtimeMessageText(firstUserMessage) || "(no messages)" : "(no messages)"),
+      firstMessage: catalogFirstMessage(firstUserText || "(no messages)"),
       ...(subagent ? {
         parentSessionId: subagent.parentSessionId,
         relation: {
@@ -2860,7 +2863,7 @@ export function getRpcSessionInfos(options: { includeTransient?: boolean } = {})
       } : side ? {
         parentSessionId: side.parentSessionId,
         relation: { kind: "side" as const, ...side },
-      } : {}),
+      } : handoff ? { relation: handoff } : {}),
       transient: !persisted,
     });
   }

@@ -11,7 +11,7 @@ import {
   type SDKSystemMessage,
   type SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
-import type { AssistantContentBlock, AssistantMessage } from "../types";
+import type { AssistantContentBlock, AssistantMessage, SessionInfo } from "../types";
 import { acquireClaudeWriterLock, type ReleaseClaudeWriterLock } from "./claude-lock";
 import { resolveClaudeExecutable, sanitizeClaudeEnvironment } from "./claude-executable";
 import {
@@ -24,6 +24,7 @@ import {
 } from "./claude-input";
 export { sanitizeClaudeEnvironment } from "./claude-executable";
 import { readClaudeConfiguration } from "./claude-config";
+import { projectSessionHandoffMessage } from "../session-handoff";
 import { isRecord, projectSdkAssistant, projectSdkUser } from "./claude-projection";
 import {
   CLAUDE_CAPABILITIES,
@@ -144,6 +145,8 @@ export interface ClaudeSessionCreateOptions {
   permissionMode?: string;
   requestId?: string;
   trustProject?: boolean;
+  handoff?: Extract<NonNullable<SessionInfo["relation"]>, { kind: "handoff" }>;
+  handoffTitle?: string;
 }
 
 export interface ClaudeRuntimeOptions extends ClaudeSessionCreateOptions {
@@ -261,7 +264,8 @@ export class ClaudeSessionWrapper {
       created: instant,
       modified: instant,
       messageCount: 0,
-      firstMessage: "",
+      firstMessage: this.options.handoffTitle ?? "",
+      ...(this.options.handoff ? { relation: this.options.handoff } : {}),
       transient: !this.options.existing,
       backend: "claude",
       nativeSessionId: this.nativeSessionId,
@@ -801,7 +805,7 @@ export class ClaudeSessionWrapper {
   }
 
   private consumeUser(source: SDKUserMessage): void {
-    const projected = projectSdkUser(source);
+    const projected = projectSdkUser(source, projectSessionHandoffMessage);
     for (const message of projected) {
       this.emit({ type: "message_start", message });
       this.emit({ type: "message_end", message });

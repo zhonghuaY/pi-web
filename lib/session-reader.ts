@@ -11,6 +11,7 @@ import { withoutMessageSignatures } from "./message-signatures";
 import { getThinkingPreview, isMessageGroupAnchor } from "./message-display";
 import { projectIdentityKey } from "./project-identity";
 import { sessionPathKey } from "./session-path";
+import { projectSessionHandoffMessage, sessionHandoffRelation, sessionHandoffTitle } from "./session-handoff";
 import { skillExpansionToCommand } from "./slash-display";
 import { MAX_TOOL_RESULT_IMAGE_BYTES, TOOL_RESULT_IMAGE_MIMES } from "./tool-result-images";
 import { resolveProject, type ProjectInfo } from "./worktree";
@@ -232,7 +233,7 @@ function resolveScannedSessionRelation(
 const CATALOG_FIRST_MESSAGE_MAX = 500;
 
 export function catalogFirstMessage(text: string): string {
-  const display = skillExpansionToCommand(text) ?? text;
+  const display = sessionHandoffTitle(text, "pi") ?? skillExpansionToCommand(text) ?? text;
   if (display.length <= CATALOG_FIRST_MESSAGE_MAX) return display;
   const last = display.charCodeAt(CATALOG_FIRST_MESSAGE_MAX - 1);
   return display.slice(0, last >= 0xd800 && last <= 0xdbff ? CATALOG_FIRST_MESSAGE_MAX - 1 : CATALOG_FIRST_MESSAGE_MAX);
@@ -244,6 +245,7 @@ function mapScannedSession(
 ): SessionInfo {
   cacheSessionPath(scanned.id, scanned.path);
   const { originSessionId, subagent, side } = resolveScannedSessionRelation(scanned, pathToId);
+  const handoff = sessionHandoffRelation(scanned.firstMessage);
   const detailsPending = scanned.detailsPending === true;
   return {
     path: scanned.path,
@@ -265,7 +267,9 @@ function mapScannedSession(
         ? { relation: { kind: "side" as const, ...side } }
         : scanned.parentSessionPath
           ? { relation: { kind: "fork" as const, ...(originSessionId ? { originSessionId } : {}) } }
-          : {}),
+          : handoff
+            ? { relation: handoff }
+            : {}),
     transient: false,
     ...(detailsPending ? { detailsPending: true } : {}),
   };
@@ -944,6 +948,7 @@ function entryToUiMessage(
       if (typeof legacyContent === "string") {
         message = { ...message, content: [{ type: "text", text: legacyContent }] } as AgentMessage;
       }
+      if (message.role === "user") return projectSessionHandoffMessage(message) ?? message;
       if (!options.deferThinking || message.role !== "assistant") return message;
       const content = message.content;
       return {

@@ -11,12 +11,15 @@ import {
 } from "@anthropic-ai/claude-agent-sdk";
 import { randomUUID } from "node:crypto";
 import { isAbsolute } from "node:path";
+import { projectSessionHandoffMessage, sessionHandoffRelation, sessionHandoffTitle } from "../session-handoff";
 import type { AgentMessage, SessionInfo } from "../types";
 import { readClaudeConfiguration } from "./claude-config";
+export { recordClaudeHandoff } from "./claude-metadata";
 import { extractText, projectClaudeHistoryMessage } from "./claude-projection";
 import {
   abortClaudeSideFork,
   beginClaudeSideFork,
+  claudeHandoffMetadata,
   claudeSidePolicy,
   completeClaudeSideFork,
   deleteClaudeWebMetadata,
@@ -94,7 +97,7 @@ function iso(value: number | undefined, fallback: number): string {
   return new Date(value ?? fallback).toISOString();
 }
 
-function sessionInfo(
+export function projectClaudeSessionInfo(
   source: SDKSessionInfo,
   metadata: ClaudeWebMetadataFile,
 ): ClaudeSessionInfo | null {
@@ -102,15 +105,24 @@ function sessionInfo(
   const webId = claudeWebSessionId(source.sessionId);
   const modified = source.lastModified || Date.now();
   const sideParent = claudeSidePolicy(source.sessionId, source.cwd, metadata)?.parentSessionId;
+  const storedHandoff = claudeHandoffMetadata(source.sessionId, metadata);
+  const promptHandoff = sessionHandoffRelation(source.firstPrompt || "");
+  const handoff = storedHandoff ? {
+    kind: "handoff" as const,
+    sourceSessionId: storedHandoff.sourceSessionId,
+    sourceBackend: storedHandoff.sourceBackend,
+    sourceEntryId: storedHandoff.sourceEntryId,
+    requestId: storedHandoff.requestId,
+  } : promptHandoff;
   return {
     path: webId,
     id: webId,
     cwd: source.cwd,
-    name: source.customTitle || source.summary || undefined,
+    name: source.customTitle || storedHandoff?.title || source.summary || undefined,
     created: iso(source.createdAt, modified),
     modified: iso(modified, modified),
     messageCount: 0,
-    firstMessage: source.firstPrompt || "",
+    firstMessage: storedHandoff?.title ?? sessionHandoffTitle(source.firstPrompt || "", "claude") ?? source.firstPrompt ?? "",
     detailsPending: true,
     branch: source.gitBranch,
     transient: false,
@@ -120,7 +132,7 @@ function sessionInfo(
     ...(sideParent ? {
       parentSessionId: sideParent,
       relation: { kind: "side" as const, parentSessionId: sideParent },
-    } : {}),
+    } : handoff ? { relation: handoff } : {}),
   };
 }
 
@@ -218,7 +230,7 @@ export async function listClaudeSessions(): Promise<SessionInfo[]> {
   const metadata = await readClaudeWebMetadata();
   const byId = new Map<string, ClaudeSessionInfo>();
   for (const source of listed) {
-    const info = sessionInfo(source, metadata);
+    const info = projectClaudeSessionInfo(source, metadata);
     if (info) byId.set(info.id, info);
   }
   for (const wrapper of registry().sessions.values()) {
@@ -241,10 +253,10 @@ async function history(webId: string): Promise<{
   const nativeInfo = await getSessionInfo(nativeId);
   if (!nativeInfo?.cwd) throw new Error("Claude session not found");
   const metadata = await readClaudeWebMetadata();
-  const info = sessionInfo(nativeInfo, metadata);
+  const info = projectClaudeSessionInfo(nativeInfo, metadata);
   if (!info) throw new Error("Claude session metadata is incomplete");
   const source = await getSessionMessages(nativeId, { dir: nativeInfo.cwd, includeSystemMessages: true });
-  return { info, source, projected: source.flatMap(projectClaudeHistoryMessage) };
+  return { info, source, projected: source.flatMap((message) => projectClaudeHistoryMessage(message, projectSessionHandoffMessage)) };
 }
 
 export async function readClaudeSession(
@@ -272,7 +284,9 @@ export async function readClaudeSession(
   const info = {
     ...all.info,
     messageCount: all.projected.length,
-    firstMessage: firstVisible ? extractText(firstVisible) : all.info.firstMessage,
+    firstMessage: all.info.relation?.kind === "handoff"
+      ? all.info.firstMessage
+      : firstVisible ? extractText(firstVisible) : all.info.firstMessage,
     detailsPending: false,
   };
   return {
@@ -333,7 +347,7 @@ export async function forkClaudeSession(
         readClaudeWebMetadata(),
       ]);
       if (!nativeInfo?.cwd) throw new Error("Claude fork metadata is unavailable");
-      const info = sessionInfo(nativeInfo, metadata);
+      const info = projectClaudeSessionInfo(nativeInfo, metadata);
       if (!info) throw new Error("Claude fork metadata is incomplete");
       wrapperFor(result.sessionId, nativeInfo.cwd, { existing: true, side: options.side });
       return info;

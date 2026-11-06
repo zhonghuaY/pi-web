@@ -12,7 +12,7 @@ export async function readClaudeSubagents(webId: string, agentId?: string, api =
   if (agentId === undefined) return { parentSessionId: webId, agents: ids.map((id) => ({ id })) };
   if (!ids.includes(agentId)) throw Object.assign(new Error("Subagent not found in this session"), { status: 404 });
   const source = await api.getSubagentMessages(nativeId, agentId, { dir: session.cwd });
-  const entries = source.flatMap(projectClaudeHistoryMessage);
+  const entries = source.flatMap((message) => projectClaudeHistoryMessage(message));
   return {
     parentSessionId: webId, agentId, cwd: session.cwd, readonly: true,
     messages: entries.map((entry) => entry.message),

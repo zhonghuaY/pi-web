@@ -703,6 +703,17 @@ test("backend discovery errors are visible with a retry action", () => {
   assert.match(html, />Retry<\/button>/);
 });
 
+test("existing-session backend selector discloses handoff and locks while creating the target", () => {
+  const html = renderToStaticMarkup(
+    React.createElement(I18nProvider, null, React.createElement(ChatInput, {
+      onSend() {}, onAbort() {}, onBackendChange() {}, isStreaming: false,
+      backend: "pi", backendHandoff: true, backendChanging: true,
+    })),
+  );
+  assert.ok(html.includes('title="Continue in another backend (creates a linked native session)"'));
+  assert.match(html, /<select[^>]*disabled=""[^>]*aria-busy="true"/);
+});
+
 test("Claude composer exposes native model and effort selectors", () => {
   const html = renderToStaticMarkup(
     React.createElement(I18nProvider, null, React.createElement(ChatInput, {

@@ -15,6 +15,7 @@ export interface ProjectedClaudeMessage {
 }
 
 type JsonRecord = Record<string, unknown>;
+type UserMessageProjector = (message: UserMessage) => AgentMessage | null;
 
 export function isRecord(value: unknown): value is JsonRecord {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -105,10 +106,12 @@ function toolResult(value: JsonRecord, at?: number): ToolResultMessage | null {
   };
 }
 
-function userMessages(message: JsonRecord, at?: number): AgentMessage[] {
+function userMessages(message: JsonRecord, at?: number, projector?: UserMessageProjector): AgentMessage[] {
   const content = message.content;
   if (!Array.isArray(content)) {
-    return typeof content === "string" ? [{ role: "user", content, timestamp: at }] : [];
+    if (typeof content !== "string") return [];
+    const message: UserMessage = { role: "user", content, timestamp: at };
+    return [projector?.(message) ?? message];
   }
   const results: ToolResultMessage[] = [];
   const visible: Array<TextContent | ImageContent> = [];
@@ -126,16 +129,16 @@ function userMessages(message: JsonRecord, at?: number): AgentMessage[] {
     }
   }
   const user: UserMessage[] = visible.length ? [{ role: "user", content: visible, timestamp: at }] : [];
-  return [...user, ...results];
+  return [...user.map((message) => projector?.(message) ?? message), ...results];
 }
 
-export function projectClaudeHistoryMessage(source: SessionMessage): ProjectedClaudeMessage[] {
+export function projectClaudeHistoryMessage(source: SessionMessage, projector?: UserMessageProjector): ProjectedClaudeMessage[] {
   if (!isRecord(source.message)) return [];
   if (source.type === "assistant") {
     return [{ entryId: source.uuid, message: assistantFromMessage(source.message) }];
   }
   if (source.type === "user") {
-    return userMessages(source.message).map((message) => ({ entryId: source.uuid, message }));
+    return userMessages(source.message, undefined, projector).map((message) => ({ entryId: source.uuid, message }));
   }
   const subtype = source.message.subtype;
   if (subtype === "compact_boundary") {
@@ -157,9 +160,9 @@ export function projectSdkAssistant(source: SDKAssistantMessage): AssistantMessa
   return source.error ? { ...projected, errorMessage: source.error } : projected;
 }
 
-export function projectSdkUser(source: SDKUserMessage): AgentMessage[] {
+export function projectSdkUser(source: SDKUserMessage, projector?: UserMessageProjector): AgentMessage[] {
   if (!isRecord(source.message)) return [];
-  return userMessages(source.message, timestamp(source.timestamp));
+  return userMessages(source.message, timestamp(source.timestamp), projector);
 }
 
 export function extractToolCalls(message: AssistantMessage): Array<{ id: string; name: string }> {

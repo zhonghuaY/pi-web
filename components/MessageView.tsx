@@ -11,6 +11,7 @@ import { useIsMobile } from "@/hooks/useIsMobile";
 import { parseCompactionSummary } from "@/lib/compaction-summary";
 import { getAssistantErrorMessage, getThinkingPreview, hasAssistantAnswer, isAssistantTruncated, isEmptyThinkingBlock, splitThinkingPieces } from "@/lib/message-display";
 import { formatTurnDuration } from "@/lib/turn-duration";
+import { HANDOFF_CONTEXT_CUSTOM_TYPE } from "@/lib/session-handoff";
 import { diffGapLabel, parseUnifiedPatch, unifiedDiffLines, type SplitDiffCell, type SplitDiffFile, type SplitDiffGap, type UnifiedDiffLine } from "@/lib/patch";
 import { applyPatchPreviewToFiles, applyPatchResultHasFailures, extractApplyPatchPaths, getApplyPatchInputText, parseApplyPatchInput } from "@/lib/apply-patch";
 import { isApplyPatchToolName, isEditToolName, isWriteToolName } from "@/lib/tool-names";
@@ -1949,8 +1950,9 @@ function CompactionFileList({ title, files }: { title: string; files: string[] }
 
 function CustomMessageView({ message, cwd, onOpenFile }: { message: CustomMessage; cwd?: string; onOpenFile?: (filePath: string, page?: number) => void }) {
   const { t } = useI18n();
-  // Expanded by default: pi's TUI always draws a displayed custom message in full.
-  const [contentExpanded, setContentExpanded] = useState(true);
+  // Native custom messages follow pi's TUI and start expanded. Handoff context
+  // is a Web-owned import envelope, so keep the repeated transcript out of the way.
+  const [contentExpanded, setContentExpanded] = useState(message.customType !== HANDOFF_CONTEXT_CUSTOM_TYPE);
   const [detailsExpanded, setDetailsExpanded] = useState(false);
   const [copied, setCopied] = useState(false);
   const text = getMessageText(message.content);

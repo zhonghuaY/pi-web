@@ -1255,6 +1255,13 @@ export function AppShell() {
     if (toolEndRefreshTimerRef.current) clearTimeout(toolEndRefreshTimerRef.current);
   }, []);
 
+  const handleSessionHandoff = useCallback((sourceSessionId: string, target: SessionInfo) => {
+    setRefreshKey((key) => key + 1);
+    // A slow transfer must not steal focus after the user moved elsewhere.
+    if (selectedSessionRef.current?.id !== sourceSessionId) return;
+    handleSelectSession(target);
+  }, [handleSelectSession]);
+
   const handleSessionForked = useCallback((newSessionId: string) => {
     invalidateWorkspaceRestore();
     activeNewSessionDraftKeyRef.current = null;
@@ -2856,6 +2863,7 @@ export function AppShell() {
               onToolEnd={handleToolEnd}
               onAttentionNeeded={handleAttentionNeeded}
               onSessionCreated={handleSessionCreated}
+              onSessionHandoff={handleSessionHandoff}
               onSessionForked={handleSessionForked}
               onSideSession={handleSideSession}
               modelsRefreshKey={modelsRefreshKey}

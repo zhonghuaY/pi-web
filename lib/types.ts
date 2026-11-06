@@ -372,8 +372,8 @@ export interface SessionInfo {
   /** True while the sidebar has only header/stat metadata for this session. */
   detailsPending?: boolean;
   parentSessionId?: string; // source session for a fork, or parent session for a subagent or side chat
-  /** How this session relates to another session. Forks remain top-level in the
-   *  UI; subagent and side relations form a visible parent/child tree. */
+  /** How this session relates to another session. Forks and handoffs remain
+   *  top-level in the UI; subagent and side relations form a parent/child tree. */
   relation?:
     | { kind: "fork"; originSessionId?: string }
     | {
@@ -383,7 +383,14 @@ export interface SessionInfo {
         description: string;
         status: SubagentSessionStatus;
       }
-    | { kind: "side"; parentSessionId: string };
+    | { kind: "side"; parentSessionId: string }
+    | {
+        kind: "handoff";
+        sourceSessionId: string;
+        sourceBackend: AgentBackend;
+        sourceEntryId?: string;
+        requestId: string;
+      };
   /** Main repo root shared by all worktrees of this cwd (cwd itself for non-git dirs).
    *  Always set by the server; optional because the client builds transient
    *  SessionInfo objects before the first refresh. Fall back to cwd. */

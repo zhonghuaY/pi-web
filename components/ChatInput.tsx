@@ -62,6 +62,9 @@ interface Props {
   onRetryBackends?: () => void;
   capabilities?: AgentCapabilities;
   onBackendChange?: (backend: AgentBackend) => void;
+  /** An existing session creates a linked native session when this changes. */
+  backendHandoff?: boolean;
+  backendChanging?: boolean;
   effectiveNativeModel?: string | null;
   shellCommandsEnabled?: boolean;
   /** Text-only composer without the session controls or outer spacing. */
@@ -720,7 +723,7 @@ export function ModelScopeWarningBanner({ warnings }: { warnings?: string[] }) {
 // Memoized: its props hold still while a reply streams or a tool runs, and the
 // chat around it re-renders through both.
 export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatInput({
-  onSend, onAbort, onSteer, onSideChat, onFollowUp, isStreaming, backend = "pi", backends, backendsLoading = false, backendsError, onRetryBackends, capabilities, onBackendChange, effectiveNativeModel, shellCommandsEnabled = true, model, isAutoModelSelection, modelNames, modelList, modelError, missingCwd, modelScopeWarnings, allModelList, onLoadAllModels, onLoadModels, onModelChange, modelSwitching,
+  onSend, onAbort, onSteer, onSideChat, onFollowUp, isStreaming, backend = "pi", backends, backendsLoading = false, backendsError, onRetryBackends, capabilities, onBackendChange, backendHandoff = false, backendChanging = false, effectiveNativeModel, shellCommandsEnabled = true, model, isAutoModelSelection, modelNames, modelList, modelError, missingCwd, modelScopeWarnings, allModelList, onLoadAllModels, onLoadModels, onModelChange, modelSwitching,
   defaultModel, onSetDefaultModel,
   onCompact, onAbortCompaction, isCompacting, compactError, onDismissCompactError, compactResult, toolPreset, onToolPresetChange,
   thinkingLevel, isAutoThinkingSelection = false, onThinkingLevelChange, availableThinkingLevels, thinkingLevelMap,
@@ -2585,10 +2588,14 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
             {onBackendChange ? (
               <select
                 value={backend}
-                onChange={(event) => onBackendChange(event.target.value as AgentBackend)}
-                disabled={isStreaming || backendsLoading}
+                onChange={(event) => {
+                  const value = event.currentTarget.value;
+                  if (value === "pi" || value === "claude") onBackendChange(value);
+                }}
+                disabled={isStreaming || backendsLoading || backendChanging}
+                aria-busy={backendChanging || undefined}
                 aria-label={t("chat.backend")}
-                title={backends?.[backend].reason ?? t("chat.backend")}
+                title={backendHandoff ? t("chat.backendHandoff") : backends?.[backend].reason ?? t("chat.backend")}
                 style={{ height: 32, maxWidth: 112, border: "none", borderRadius: 9, background: "var(--bg-hover)", color: "var(--text)", padding: "0 8px", fontSize: 12 }}
               >
                 <option value="pi" disabled={backends?.pi.available === false}>Pi</option>

@@ -69,6 +69,7 @@ interface Props {
   onToolEnd?: (toolName: string) => void;
   onAttentionNeeded?: (request: BlockingExtensionUiRequest) => void;
   onSessionCreated?: (session: SessionInfo, sourceDraftKey: string) => void;
+  onSessionHandoff?: (sourceSessionId: string, target: SessionInfo) => void;
   onSessionForked?: (newSessionId: string) => void;
   /** A subagent's or side chat's tab beside the main chat: the page's global shortcuts stay with the main chat. */
   panel?: boolean;
@@ -258,7 +259,7 @@ function ProcessDetailsGroup({ messageCount, toolCallCount, durationMs, cacheMis
   );
 }
 
-export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initialScrollPosition, onScrollPositionChange, sessionRunning, newSessionCwd, newSessionDraftKey, newSessionContextBar, initialNewSessionChoices, onNewSessionChoicesChange, onBackendScopeChange, onAgentEnd, onToolEnd, onAttentionNeeded, onSessionCreated, onSessionForked, panel = false, onSideSession, modelsRefreshKey, chatInputRef, onBranchDataChange, onSystemPromptChange, onSystemToolsChange, onSystemInfoLoaderChange, onDebugSnapshotReaderChange, onSessionStatsChange, onSessionStatsPanelOpen, onOpenSettings, onContextUsageChange, onOpenFile, onFilesUploaded, onOpenSubagent, quoteSelectionEnabled = false, initialPrompt, onInitialPromptConsumed, soundEnabled = true, onSoundToggle, playDoneSound = () => {}, unlockAudio, holdAudio }: Props) {
+export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initialScrollPosition, onScrollPositionChange, sessionRunning, newSessionCwd, newSessionDraftKey, newSessionContextBar, initialNewSessionChoices, onNewSessionChoicesChange, onBackendScopeChange, onAgentEnd, onToolEnd, onAttentionNeeded, onSessionCreated, onSessionHandoff, onSessionForked, panel = false, onSideSession, modelsRefreshKey, chatInputRef, onBranchDataChange, onSystemPromptChange, onSystemToolsChange, onSystemInfoLoaderChange, onDebugSnapshotReaderChange, onSessionStatsChange, onSessionStatsPanelOpen, onOpenSettings, onContextUsageChange, onOpenFile, onFilesUploaded, onOpenSubagent, quoteSelectionEnabled = false, initialPrompt, onInitialPromptConsumed, soundEnabled = true, onSoundToggle, playDoneSound = () => {}, unlockAudio, holdAudio }: Props) {
   const { t } = useI18n();
   const isMobile = useIsMobile();
   const completionNotificationsEnabled = !isHiddenRelation(session?.relation);
@@ -289,7 +290,7 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
 
   const {
     loading, error, messages, activeToolResults, entryIds, messageKeys, historyCursor, hasEarlierMessages, earlierTurnCount, streamingStore,
-    backend, backends, backendsLoading, backendsError, retryBackendDiscovery, capabilities, handleBackendChange, effectiveNativeModel, agentInteraction, waitingAgentInteractionCount, respondToAgentInteraction, pendingClaudeTrustSubmission, confirmClaudeProjectTrust, cancelClaudeProjectTrust,
+    backend, backends, backendsLoading, backendsError, retryBackendDiscovery, capabilities, handleBackendChange, handleSessionHandoff, handoffSwitching, effectiveNativeModel, agentInteraction, waitingAgentInteractionCount, respondToAgentInteraction, pendingClaudeTrustSubmission, confirmClaudeProjectTrust, cancelClaudeProjectTrust,
     agentRunning, bashRunning, pendingBash, modelNames, modelList, modelError, missingCwd, modelScopeWarnings, isModelScopeActive, allModelList, modelThinkingLevels, modelThinkingLevelMaps, toolPreset, thinkingLevel,
     retryInfo, contextUsage, forkingEntryId,
     isCompacting, compactError, compactResult, displayModel: displayModelValue, modelSwitching, sessionStats,
@@ -313,7 +314,7 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
     handleToolPresetChange, handleThinkingLevelChange, handleSetDefaultModel, handleSetDefaultThinkingLevel, loadSlashCommands, loadModelsForPicker, loadAllModels, scrollUserMsgToTop,
     loadContext, activeLeafId, scrollToBottom, scrollToMessage,
   } = useAgentSession({
-    session, sessionRunning, newSessionCwd, newSessionDraftKey, initialNewSessionChoices, onNewSessionChoicesChange, onBackendScopeChange, onAgentEnd: wrappedOnAgentEnd, onToolEnd, onAttentionNeeded, onSessionCreated, onSessionForked, onSideSession,
+    session, sessionRunning, newSessionCwd, newSessionDraftKey, initialNewSessionChoices, onNewSessionChoicesChange, onBackendScopeChange, onAgentEnd: wrappedOnAgentEnd, onToolEnd, onAttentionNeeded, onSessionCreated, onSessionHandoff, onSessionForked, onSideSession,
     modelsRefreshKey, chatInputRef, onBranchDataChange, onSystemPromptChange, onSystemToolsChange, onSystemInfoLoaderChange, onSessionStatsPanelOpen,
     onOpenSettings, onDebugSnapshotReaderChange, t,
     deferInitialScroll: Boolean(pendingScrollRestore),
@@ -968,7 +969,13 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
       backendsError={backendsError}
       onRetryBackends={retryBackendDiscovery}
       capabilities={capabilities}
-      onBackendChange={isNew ? handleBackendChange : undefined}
+      onBackendChange={isNew
+        ? handleBackendChange
+        : session && !isHiddenRelation(session.relation) && onSessionHandoff
+          ? handleSessionHandoff
+          : undefined}
+      backendHandoff={!isNew}
+      backendChanging={handoffSwitching}
       effectiveNativeModel={effectiveNativeModel}
       shellCommandsEnabled={backend === "pi"}
       model={displayModelValue}
@@ -1096,7 +1103,7 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
       )}
       <div className="relative flex min-h-0 min-w-0 flex-1 overflow-hidden">
         {pendingClaudeTrustSubmission && (session?.cwd ?? newSessionCwd) && (
-          <ClaudeProjectTrustDialog cwd={(session?.cwd ?? newSessionCwd)!} existingSession={Boolean(session)} onConfirm={confirmClaudeProjectTrust} onCancel={cancelClaudeProjectTrust} />
+          <ClaudeProjectTrustDialog cwd={(session?.cwd ?? newSessionCwd)!} existingSession={Boolean(session && backend === "claude")} onConfirm={confirmClaudeProjectTrust} onCancel={cancelClaudeProjectTrust} />
         )}
         {agentInteraction && (
           <AgentInteractionDialog key={agentInteraction.id} request={agentInteraction} waitingCount={waitingAgentInteractionCount} onRespond={respondToAgentInteraction} />

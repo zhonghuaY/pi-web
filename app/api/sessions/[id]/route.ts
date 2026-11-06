@@ -23,6 +23,7 @@ import { readSessionToolSelection } from "@/lib/session-tool-selection";
 import { jsonResponse } from "@/lib/json-response";
 import { deleteSessions } from "@/lib/session-delete";
 import { attachTranscriptNotices, readSessionTranscriptNotices } from "@/lib/transcript-notices-server";
+import { sessionHandoffRelation, sessionHandoffTitle } from "@/lib/session-handoff";
 
 export async function GET(
   req: Request,
@@ -117,6 +118,17 @@ export async function GET(
     const side = !subagent && header ? readSideRelation(entries as never) : null;
     const toolNames = readSubagentSessionResources(entries as never)?.tools
       ?? readSessionToolSelection(entries as never);
+    const firstUserText = firstUserMessage
+      ? (() => {
+          const content = (firstUserMessage as { content: unknown }).content;
+          return typeof content === "string"
+            ? content
+            : Array.isArray(content)
+              ? (content.find((block: { type: string }) => block.type === "text") as { text: string } | undefined)?.text ?? ""
+              : "";
+        })()
+      : "";
+    const handoff = sessionHandoffRelation(firstUserText);
     const info = header ? (await attachSessionProjectInfo([{
       path: filePath,
       id: header.id,
@@ -125,12 +137,7 @@ export async function GET(
       created: header.timestamp,
       modified,
       messageCount: stats.totalMessages,
-      firstMessage: firstUserMessage
-        ? (() => {
-            const c = (firstUserMessage as { content: unknown }).content;
-            return typeof c === "string" ? c : (Array.isArray(c) ? (c.find((b: { type: string }) => b.type === "text") as { text: string } | undefined)?.text ?? "" : "") || "(no messages)";
-          })()
-        : "(no messages)",
+      firstMessage: (sessionHandoffTitle(firstUserText, "pi") ?? firstUserText) || "(no messages)",
       parentSessionId,
       ...(subagent
         ? { relation: { kind: "subagent" as const, parentSessionId: subagent.parentSessionId, profile: subagent.profile, description: subagent.description, status: subagentDisplayStatus(header.id, subagent.status) } }
@@ -138,7 +145,9 @@ export async function GET(
           ? { relation: { kind: "side" as const, ...side } }
           : header.parentSession
             ? { relation: { kind: "fork" as const, ...(parentSessionId ? { originSessionId: parentSessionId } : {}) } }
-            : {}),
+            : handoff
+              ? { relation: handoff }
+              : {}),
       transient: !filePath || !existsSync(filePath),
     }]))[0] : null;
 

@@ -690,6 +690,9 @@ test("collapses a displayed custom message from its header alone", () => {
   assert.match(shown, /a message with no details/);
   // A message with no text (images only) can collapse too.
   assert.match(header(custom({ content: [] })), /aria-expanded="true"/);
+  // Imported context is a Web-owned repeated transcript envelope, not a
+  // native extension message, so it stays out of the way until opened.
+  assert.match(header(custom({ customType: "Imported context", content: "copied history" })), /aria-expanded="false"/);
 
   // A message that does carry details keeps that button, for its details.
   assert.match(

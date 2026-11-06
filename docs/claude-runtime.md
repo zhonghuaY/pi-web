@@ -1,6 +1,6 @@
 # Claude and Pi sessions
 
-Choose **Pi** or **Claude** in a new conversation. The choice stays fixed after creation. Pi remains the default. Claude uses native Claude Code through the pinned official Agent SDK; it does not send a Claude model through Pi.
+Choose **Pi** or **Claude** in a new conversation. Each native session keeps that backend for its lifetime. Pi remains the default. Claude uses native Claude Code through the pinned official Agent SDK; it does not send a Claude model through Pi.
 
 ## Native configuration
 
@@ -20,12 +20,19 @@ Claude native slash commands stay native. Their live catalogue, including projec
 
 Avoid continuing the same native session simultaneously from Web and an external CLI. Web coordinates its own writers, but cannot reliably detect an external terminal writer. Forking does not roll back files.
 
+## Continue in the other backend
+
+In an existing main session, choosing the other backend creates a linked native target session in the same project and navigates to it. This is a context handoff, not transcript conversion: the source session remains unchanged, the target gets its own native id and runtime state, and returning to the original backend creates another native node.
+
+The first target prompt carries a fixed source tip plus a bounded envelope of visible user/assistant text and displayed summaries. It explicitly omits tool identities/results, thinking, images, permissions, MCP state, usage, branches and subagents. The chat shows that envelope as a collapsed **Imported context** card. A stable request id makes ambiguous retries converge on the same target. Claude targets require the normal explicit project-trust confirmation. Side chats and subagent sessions cannot initiate a handoff.
+
 ## Limits and operations
 
 - The pinned SDK can return historical system entries without their content or subtype. Native compaction and its summary work, but Web does not invent historical compaction markers from those incomplete entries. History and export follow the native history API’s available conversation chain.
 - Historical aggregate token/cost statistics are unavailable where the native history API does not supply them. Latest native result metrics keep their cumulative query/session scope; repeated results are not summed.
 - HTML export is a safe conversation display export, not a portable Claude session backup. Native transcripts remain authoritative.
 - Native fork side-policy metadata is stored separately from the transcript. An interrupted side-fork transaction fails closed by quarantining new sessions in that project until the transaction can be resolved; do not remove its policy metadata to bypass the restriction.
+- Cross-backend handoff provenance is also stored in `claude-session-metadata.json`. The SDK may truncate `firstPrompt`, so catalogue relation recovery and the handoff title use this metadata; the complete native prompt still carries the marker and imported context for history and model input.
 - `PI_WEB_CLAUDE=0` (or `false`) disables Claude runtime and native mutations while leaving history visible. Pi continues normally.
 - Run the application under a service environment that can find the intended Claude executable. Installing the SDK alone does not install or configure native CLI authentication.
 
