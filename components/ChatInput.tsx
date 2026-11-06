@@ -2587,7 +2587,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
             </button>
             {onBackendChange ? (
               <select
-                value={backend}
+                value={backendHandoff && backendChanging ? (backend === "pi" ? "claude" : "pi") : backend}
                 onChange={(event) => {
                   const value = event.currentTarget.value;
                   if (value === "pi" || value === "claude") onBackendChange(value);

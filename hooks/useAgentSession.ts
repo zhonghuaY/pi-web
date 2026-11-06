@@ -2821,7 +2821,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       }));
 
       const sid = sessionIdRef.current;
-      if (sid && claudeProjectTrustConfirmedRef.current) {
+      if (sid && (claudeProjectTrustConfirmedRef.current || runtimeRequiresProjectTrust === false)) {
         const live = await sendAgentCommand<ClaudeModelsResponse>(sid, { type: "get_models" });
         signal?.throwIfAborted();
         effectiveModel = live.effectiveModel ?? effectiveModel;
@@ -2964,7 +2964,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         );
       }
     }
-  }, [backend, backends.claude.claude?.model, isNew, newSessionCwd, session?.cwd]);
+  }, [backend, backends.claude.claude?.model, isNew, newSessionCwd, runtimeRequiresProjectTrust, session?.cwd]);
 
   const loadModelsForPicker = useCallback(async () => {
     if (
@@ -2975,8 +2975,9 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       setPendingClaudeTrustSubmission({ kind: "discovery" });
       return;
     }
+    if (backendRef.current === "claude" && !sessionIdRef.current) await ensureNewSession();
     await loadModels();
-  }, [backends.claude.claude?.requiresProjectTrust, isNew, loadModels, runtimeRequiresProjectTrust]);
+  }, [backends.claude.claude?.requiresProjectTrust, ensureNewSession, isNew, loadModels, runtimeRequiresProjectTrust]);
 
   // pi's /model "all" scope: names and reasoning levels of models outside
   // `enabledModels` join the maps, so a picked unscoped model shows them too.

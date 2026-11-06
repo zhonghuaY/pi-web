@@ -22,6 +22,7 @@ function visit(node) {
 }
 visit(source);
 const loader = nodes.find((node) => ts.isVariableDeclaration(node) && node.name.getText(source) === "loadModels");
+const pickerLoader = nodes.find((node) => ts.isVariableDeclaration(node) && node.name.getText(source) === "loadModelsForPicker");
 const schedule = nodes.find((node) => ts.isVariableDeclaration(node) && node.name.getText(source) === "MODELS_RETRY_DELAYS_MS");
 const effect = nodes.find((node) => ts.isCallExpression(node)
   && node.expression.getText(source) === "useEffect"
@@ -31,6 +32,7 @@ function script(text) {
   return new Script(ts.transpileModule(text, { compilerOptions: { target: ts.ScriptTarget.ESNext } }).outputText);
 }
 const loadScript = script(`(${loader.initializer.arguments[0].getText(source)})`);
+const pickerLoadScript = script(`(${pickerLoader.initializer.arguments[0].getText(source)})`);
 const retryScript = script(retry.getText(source));
 const thinkingParser = nodes.find((node) => ts.isFunctionDeclaration(node) && node.name?.getText(source) === "asConcreteThinkingLevel");
 const parseConcreteThinkingLevel = script(`(${thinkingParser.getText(source)})`).runInNewContext({
@@ -238,6 +240,57 @@ test("trusted Claude discovery keeps every native model once and honors effort c
   assert.deepEqual(Array.from(levels["claude:fast"]), []);
   assert.deepEqual(Array.from(levels["claude:deep"]), ["high", "max"]);
   assert.ok(state.writes.some(([name, value]) => name === "NewSessionDefaultModel" && value.modelId === "custom-current"));
+});
+
+test("a server-trusted Claude session can load the live catalogue after a page reload", async () => {
+  const state = setup(async () => { throw new Error("Claude must not read the Pi model route"); });
+  state.context.backend = "claude";
+  state.context.backendRef.current = "claude";
+  state.context.sessionIdRef.current = "claude:session";
+  state.context.claudeProjectTrustConfirmedRef.current = false;
+  state.context.runtimeRequiresProjectTrust = false;
+  state.context.sendAgentCommand = async () => ({
+    effectiveModel: "gateway/current",
+    models: [{ value: "gateway/current", displayName: "Gateway Current", supportsEffort: true, supportedEffortLevels: ["high"] }],
+  });
+
+  await state.context.loadModels();
+  assert.deepEqual(
+    Array.from(state.writes.findLast(([name]) => name === "ModelList")[1], (model) => model.id),
+    ["gateway/current"],
+  );
+});
+
+test("fresh Claude model discovery creates its native session before loading the catalogue", async () => {
+  const calls = [];
+  const context = {
+    backendRef: { current: "claude" },
+    sessionIdRef: { current: null },
+    claudeProjectTrustConfirmedRef: { current: true },
+    isNew: true,
+    runtimeRequiresProjectTrust: null,
+    backends: { claude: { claude: { requiresProjectTrust: false } } },
+    requiresClaudeProjectTrust: () => false,
+    setPendingClaudeTrustSubmission() {},
+    ensureNewSession: async () => {
+      calls.push("ensure:start");
+      await Promise.resolve();
+      context.sessionIdRef.current = "claude:session";
+      calls.push("ensure:ready");
+      return context.sessionIdRef.current;
+    },
+    loadModels: async () => {
+      calls.push(`models:${context.sessionIdRef.current}`);
+    },
+  };
+
+  const loadModelsForPicker = pickerLoadScript.runInNewContext(context);
+  await loadModelsForPicker();
+  assert.deepEqual(calls, [
+    "ensure:start",
+    "ensure:ready",
+    "models:claude:session",
+  ]);
 });
 
 test("returning from Claude to Pi reloads the cwd catalogue and rejects stale carried choices", async () => {

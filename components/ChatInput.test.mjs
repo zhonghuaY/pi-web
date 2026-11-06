@@ -712,6 +712,8 @@ test("existing-session backend selector discloses handoff and locks while creati
   );
   assert.ok(html.includes('title="Continue in another backend (creates a linked native session)"'));
   assert.match(html, /<select[^>]*disabled=""[^>]*aria-busy="true"/);
+  assert.doesNotMatch(html, /<option value="pi" selected=""/);
+  assert.match(html, /<option value="claude" selected=""/);
 });
 
 test("Claude composer exposes native model and effort selectors", () => {
