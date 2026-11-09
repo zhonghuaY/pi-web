@@ -25,6 +25,10 @@
 .DS_Store
 *.pem
 /.agents/
+/.audit/
+/.pi/
+/.claude/
+/patches/
 /skills-lock.json
 
 # debug
