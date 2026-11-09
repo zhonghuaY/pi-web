@@ -1,9 +1,11 @@
+import { isClaudeEffort } from "./agent-session-choices";
+import { parseSessionKey } from "./session-identity";
 import { NextResponse } from "next/server";
 import { stat } from "node:fs/promises";
 import { isAbsolute } from "node:path";
 import { createAgentEventStream } from "./agent-event-stream";
 import { allowFileRoot } from "./file-access";
-import { invalidateSessionListCache, attachSessionProjectInfo } from "./session-reader";
+import { invalidateSessionListCache } from "./session-reader";
 import { describeStreamClient } from "./stream-client";
 import { isValidLivenessHolder } from "./session-liveness";
 import { forgetSessionUiState } from "./session-ui-state";
@@ -11,7 +13,8 @@ export { claudeEnabled, claudeBackend } from "./agent-catalog";
 import { claudeEnabled, claudeBackend } from "./agent-catalog";
 
 export function isClaudeKey(id: string): boolean {
-  return id.startsWith("claude:");
+  const result = parseSessionKey(id);
+  return result.ok && result.key.backend === "claude";
 }
 
 export function claudeFailure(error: unknown): Response {
@@ -35,7 +38,7 @@ export async function claudeCreate(body: Record<string, unknown>): Promise<Respo
     if (body.modelId !== undefined && (typeof body.modelId !== "string" || !body.modelId.trim())) {
       return NextResponse.json({ error: "Claude modelId must be a non-empty string" }, { status: 400 });
     }
-    if (body.effort !== undefined && (typeof body.effort !== "string" || !["low", "medium", "high", "xhigh", "max"].includes(body.effort))) {
+    if (body.effort !== undefined && !isClaudeEffort(body.effort)) {
       return NextResponse.json({ error: "Unsupported Claude effort level" }, { status: 400 });
     }
     if (typeof body.requestId !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(body.requestId)) {
@@ -92,18 +95,6 @@ export async function claudeEvents(req: Request, id: string): Promise<Response> 
       holder: isValidLivenessHolder(holder) ? holder : null,
       ...describeStreamClient(req.headers),
     }), { headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no" } });
-  } catch (error) { return claudeFailure(error); }
-}
-
-export async function claudeSession(req: Request, id: string, contextOnly = false): Promise<Response> {
-  try {
-    const params = new URL(req.url).searchParams;
-    const count = Number(params.get("tail"));
-    const tail = Number.isInteger(count) && count > 0 ? Math.min(count, 1000) : 50;
-    const before = params.get("before") ?? undefined;
-    const snapshot = await (await claudeBackend()).readClaudeSession(id, { tail, before });
-    const info = (await attachSessionProjectInfo([snapshot.info]))[0];
-    return NextResponse.json(contextOnly ? { context: snapshot.context, tail, before: before ?? null } : { ...snapshot, info }, { headers: { "Cache-Control": "no-store" } });
   } catch (error) { return claudeFailure(error); }
 }
 

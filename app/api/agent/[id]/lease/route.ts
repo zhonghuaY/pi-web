@@ -1,31 +1,16 @@
 import { NextResponse } from "next/server";
-import { isClaudeKey, claudeBackend } from "@/lib/claude-routes";
-import { getRpcSession } from "@/lib/rpc-manager";
-import { hasUnsettledSubagentRun } from "@/lib/subagent-runtime";
+import { sessions } from "@/lib/backend-service";
 
-// POST /api/agent/[id]/lease - A page renews the session it has selected, whether or not it
-// holds the event stream: the session's idle countdown starts over (renewIdleTimer()), so it
-// is reaped one idle timeout after the last page let go. The reply says what is under way:
-// a hidden page lets go of an idle stream and opens it again when this reports activity
-// (#1283). Never starts a wrapper.
+// POST /api/agent/[id]/lease renews the selected session without starting a wrapper.
 export async function POST(
   _req: Request,
   { params }: { params: Promise<{ id: string }> },
 ) {
   const { id } = await params;
-  const session = isClaudeKey(id) ? (await claudeBackend()).getClaudeSession(id) : getRpcSession(id);
-  const alive = Boolean(session?.isAlive());
-  // A wrapper built before a hot reload lacks the method; its own timer still runs.
-  if (alive && typeof session!.renewIdleTimer === "function") session!.renewIdleTimer();
-  return NextResponse.json({
-    success: true,
-    // A run, a queued prompt, a `!` command or a compaction (isRunning()).
-    running: alive && session!.isRunning(),
-    // An extension dialog waiting for an answer.
-    awaitingInput: alive && session!.isAwaitingInput(),
-    // A subagent under this session, at any depth, whose end starts a turn here.
-    subagentsActive: isClaudeKey(id)
-      ? Boolean(alive && session && "hasActiveSubagents" in session && session.hasActiveSubagents())
-      : hasUnsettledSubagentRun(id),
-  }, { headers: { "Cache-Control": "no-store" } });
+  const result = await sessions.lease({ id });
+  if (!result.ok) {
+    if (result.kind === "invalid") return NextResponse.json({ error: "Invalid session id", reason: result.reason }, { status: 400 });
+    return NextResponse.json({ error: "Codex sessions are not available", reason: "backend-unavailable" }, { status: 400 });
+  }
+  return NextResponse.json(result.value, { headers: { "Cache-Control": "no-store" } });
 }

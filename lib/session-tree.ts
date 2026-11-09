@@ -18,6 +18,7 @@
  */
 
 import { listSessionFamilies, type SessionFamily } from "./session-family";
+import { sessionCapabilities } from "./agent-backends";
 import { storedProjectName, type ProjectMovePosition, type SessionUiFamilyState, type SessionUiState } from "./session-ui-state-shared";
 import type { SessionInfo } from "./types";
 import { workspaceKeyOf } from "./workspace-memory";
@@ -646,12 +647,13 @@ export function familiesToArchive(
  */
 export function archivedFamilyIds(
   input: Pick<SessionTreeInput, "sessions" | "uiState" | "runningIds">,
-  filter: { projectKey?: string; archivedBefore?: number } = {},
+  filter: { projectKey?: string; archivedBefore?: number; deletableOnly?: boolean } = {},
 ): string[] {
   const ids: string[] = [];
   for (const family of listSessionFamilies(input.sessions)) {
     if (filter.projectKey !== undefined && familyProjectKey(family) !== filter.projectKey) continue;
     if (!isFamilyArchived(family, input.uiState, input.runningIds)) continue;
+    if (filter.deletableOnly && !sessionCapabilities(family.root).delete) continue;
     if (filter.archivedBefore !== undefined) {
       const archivedAt = finiteNumber(familyEntry(input.uiState, family.root.id)?.archivedAt);
       if (archivedAt === null || archivedAt >= filter.archivedBefore) continue;
@@ -659,6 +661,16 @@ export function archivedFamilyIds(
     ids.push(family.root.id);
   }
   return ids;
+}
+
+export function archiveBulkActionIds(
+  input: Pick<SessionTreeInput, "sessions" | "uiState" | "runningIds">,
+  filter: { projectKey?: string; archivedBefore?: number } = {},
+): { restore: string[]; delete: string[] } {
+  return {
+    restore: archivedFamilyIds(input, filter),
+    delete: archivedFamilyIds(input, { ...filter, deletableOnly: true }),
+  };
 }
 
 /**
@@ -676,6 +688,7 @@ export function familiesToDelete(
   let running = 0;
   for (const family of listSessionFamilies(input.sessions)) {
     if (familyProjectKey(family) !== projectKey || family.root.transient) continue;
+    if (!sessionCapabilities(family.root).delete) continue;
     if (anyMemberIn(family, input.runningIds) || (input.awaitingIds && anyMemberIn(family, input.awaitingIds))) {
       running++;
       continue;

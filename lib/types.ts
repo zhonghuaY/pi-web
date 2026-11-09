@@ -1,6 +1,7 @@
 // Types mirrored from pi-mono coding-agent session-manager
 
-import type { AgentBackend, AgentCapabilities } from "@/lib/agent-backends";
+import type { AgentCapabilities } from "@/lib/agent-backends";
+import type { BackendId } from "@/lib/session-identity";
 
 export interface SessionHeader {
   type: "session";
@@ -111,6 +112,7 @@ export interface BashExecutionMessage {
   role: "bashExecution";
   command: string;
   output: string;
+  codexStatus?: "inProgress" | "completed" | "failed" | "declined";
   exitCode?: number;
   cancelled?: boolean;
   truncated?: boolean;
@@ -358,7 +360,7 @@ export interface SessionTreeNode {
 
 export interface SessionInfo {
   /** Missing on historical Pi sessions for compatibility. */
-  backend?: AgentBackend;
+  backend?: BackendId;
   /** Missing Pi capabilities preserve the existing full Pi feature set. */
   capabilities?: AgentCapabilities;
   path: string;
@@ -387,7 +389,7 @@ export interface SessionInfo {
     | {
         kind: "handoff";
         sourceSessionId: string;
-        sourceBackend: AgentBackend;
+        sourceBackend: BackendId;
         sourceEntryId?: string;
         requestId: string;
       };

@@ -90,6 +90,7 @@ async function setup() {
   let reader = null;
   const hook = renderHook(useAgentSession, {
     session: { id: "s1", cwd: "/project", path: "/s1.jsonl", name: "s1" },
+    t: (key) => key,
     onAgentEnd: (end) => ends.push(end),
     onDebugSnapshotReaderChange: (next) => { reader = next; },
   });

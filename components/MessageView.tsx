@@ -2317,8 +2317,8 @@ function BashExecutionView({ message, sessionId }: { message: BashExecutionMessa
   const [loadingFull, setLoadingFull] = useState(false);
   const [fullError, setFullError] = useState<string | null>(null);
 
-  const isPending = !message.output && message.exitCode === undefined && !message.cancelled;
-  const isError = message.cancelled || (message.exitCode !== undefined && message.exitCode !== 0);
+  const isPending = !message.output && !message.cancelled && (message.codexStatus ? message.codexStatus === "inProgress" : message.exitCode === undefined);
+  const isError = message.cancelled || message.codexStatus === "failed" || message.codexStatus === "declined" || (message.exitCode !== undefined && message.exitCode !== 0);
   const fullOutputUrl = sessionId && message.fullOutputPath
     ? `/api/agent/${encodeURIComponent(sessionId)}/bash-output?path=${encodeURIComponent(message.fullOutputPath)}`
     : null;

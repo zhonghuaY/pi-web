@@ -30,6 +30,7 @@ import {
 } from "@/lib/thinking-expansion-preference";
 import { ModelsConfig } from "./ModelsConfig";
 import { setupPushSubscription } from "@/lib/push-client";
+import { CodexInventory } from "./CodexInventory";
 import { SkillsConfig } from "./SkillsConfig";
 import { AgentsConfig } from "./AgentsConfig";
 import { PluginsConfig } from "./PluginsConfig";
@@ -611,6 +612,22 @@ function ClaudeNativeSettings({ backends, section }: { backends?: AgentBackends;
   </div>;
 }
 
+const ALL_SETTINGS_SECTIONS: readonly SettingsSection[] = ["general", "models", "skills", "agents", "plugins", "mcp"];
+
+export function settingsSectionsForBackend(backend: AgentBackend): readonly SettingsSection[] {
+  return backend === "codex"
+    ? ["general", "models", "skills", "mcp"]
+    : ALL_SETTINGS_SECTIONS;
+}
+
+export function CodexNativeModelSettings() {
+  const { t } = useI18n();
+  return <div className="settings-section-content" style={{ maxWidth: 760 }}>
+    <h2 style={{ margin: "0 0 8px", fontSize: 17 }}>{t("codexSettings.modelsTitle")}</h2>
+    <p style={{ margin: "0", color: "var(--text-muted)", fontSize: 13, lineHeight: 1.6 }}>{t("codexSettings.modelsDescription")}</p>
+  </div>;
+}
+
 export function SettingsPanel({
   cwd,
   backend = "pi",
@@ -627,9 +644,11 @@ export function SettingsPanel({
   onProjectTrustChanged,
 }: Props) {
   const { t } = useI18n();
-  const [section, setSection] = useState<SettingsSection>(initialSection);
+  const availableSectionIds = settingsSectionsForBackend(backend);
+  const initialVisibleSection = availableSectionIds.includes(initialSection) ? initialSection : "general";
+  const [section, setSection] = useState<SettingsSection>(initialVisibleSection);
   const [mountedSections, setMountedSections] = useState<ReadonlySet<SettingsSection>>(
-    () => new Set([section]),
+    () => new Set([initialVisibleSection]),
   );
   // Which sections need a project is decided once, in lib/settings-navigation.ts.
   const sections: { id: SettingsSection; label: string; requiresProject: boolean }[] = ([
@@ -639,7 +658,9 @@ export function SettingsPanel({
     { id: "agents", label: t("common.agents") },
     { id: "plugins", label: t("common.plugins") },
     { id: "mcp", label: t("settings.mcp") },
-  ] as const).map((item) => ({ ...item, requiresProject: settingsSectionRequiresProject(item.id) }));
+  ] as const)
+    .filter((item) => availableSectionIds.includes(item.id))
+    .map((item) => ({ ...item, requiresProject: settingsSectionRequiresProject(item.id) }));
   const sectionRequiresProject = settingsSectionRequiresProject(section);
   const isPhone = useIsMobile();
   const phone = usePhoneSettingsLevel(isPhone, openAtHome);
@@ -673,7 +694,14 @@ export function SettingsPanel({
     reportDetailTitle: setDetailTitle,
   }), [enterPhoneLevel, goUpPhoneLevel, phone.level, phoneLevelRef]);
 
-  useEffect(() => setLastSettingsSection(initialSection), [initialSection]);
+  useEffect(() => setLastSettingsSection(initialVisibleSection), [initialVisibleSection]);
+
+  useEffect(() => {
+    if (settingsSectionsForBackend(backend).includes(section)) return;
+    setSection("general");
+    setMountedSections((current) => new Set(current).add("general"));
+    setLastSettingsSection("general");
+  }, [backend, section]);
 
   // Bubble phase, unless something nearer handled the key. The trust dialog,
   // which opens above Settings, takes Escape in the capture phase and stops it,
@@ -808,14 +836,14 @@ export function SettingsPanel({
           )}
           <ConfigDetailNavigationContext.Provider value={detailNavigation}>
           {sectionHost("general", <GeneralSettings backend={backend} sessionId={sessionId} onSessionReloaded={onSessionReloaded} quoteSelectionEnabled={quoteSelectionEnabled} onQuoteSelectionChange={onQuoteSelectionChange} />)}
-          {sectionHost("models", backend === "claude" ? <ClaudeNativeSettings backends={backends} section="models" /> : <ModelsConfig embedded cwd={cwd} onClose={onClose} />)}
+          {sectionHost("models", backend === "codex" ? <CodexNativeModelSettings /> : backend === "claude" ? <ClaudeNativeSettings backends={backends} section="models" /> : <ModelsConfig embedded cwd={cwd} onClose={onClose} />)}
           {/* Visited sections stay mounted, so the ones whose answer depends on trust take the page's
               status and load again in place when trusting from Settings › MCP changes it. */}
-          {cwd && sectionHost("skills", backend === "claude" ? <ClaudeNativeSettings backends={backends} section="skills" /> : <SkillsConfig embedded key={cwd} cwd={cwd} trust={projectTrust} onClose={onClose} />)}
-          {cwd && sectionHost("agents", backend === "claude" ? <ClaudeNativeSettings backends={backends} section="agents" /> : <AgentsConfig embedded key={cwd} cwd={cwd} sessionId={sessionId} trust={projectTrust} onClose={onClose} onReloaded={onSessionReloaded} />)}
-          {cwd && sectionHost("plugins", backend === "claude" ? <ClaudeNativeSettings backends={backends} section="plugins" /> : <PluginsConfig embedded key={cwd} cwd={cwd} sessionId={sessionId} trust={projectTrust} onClose={onClose} onReloaded={onSessionReloaded} />)}
+          {cwd && sectionHost("skills", backend === "codex" ? <CodexInventory key={`skills:${cwd}:${sessionId}`} kind="skills" cwd={cwd} sessionId={sessionId} /> : backend === "claude" ? <ClaudeNativeSettings backends={backends} section="skills" /> : <SkillsConfig embedded key={cwd} cwd={cwd} trust={projectTrust} onClose={onClose} />)}
+          {cwd && backend !== "codex" && sectionHost("agents", backend === "claude" ? <ClaudeNativeSettings backends={backends} section="agents" /> : <AgentsConfig embedded key={cwd} cwd={cwd} sessionId={sessionId} trust={projectTrust} onClose={onClose} onReloaded={onSessionReloaded} />)}
+          {cwd && backend !== "codex" && sectionHost("plugins", backend === "claude" ? <ClaudeNativeSettings backends={backends} section="plugins" /> : <PluginsConfig embedded key={cwd} cwd={cwd} sessionId={sessionId} trust={projectTrust} onClose={onClose} onReloaded={onSessionReloaded} />)}
           {/* Claude uses native read-only resources; Pi keeps its editors. */}
-          {sectionHost("mcp", backend === "claude" ? <ClaudeNativeSettings backends={backends} section="mcp" /> : <McpConfig embedded key={cwd ?? ""} cwd={cwd} trust={projectTrust} onTrustProject={onOpenTrustDialog} onProjectTrustChanged={onProjectTrustChanged} onClose={onClose} />)}
+          {sectionHost("mcp", backend === "codex" ? <CodexInventory key={`mcp:${cwd}:${sessionId}`} kind="mcp" cwd={cwd ?? undefined} sessionId={sessionId} /> : backend === "claude" ? <ClaudeNativeSettings backends={backends} section="mcp" /> : <McpConfig embedded key={cwd ?? ""} cwd={cwd} trust={projectTrust} onTrustProject={onOpenTrustDialog} onProjectTrustChanged={onProjectTrustChanged} onClose={onClose} />)}
           </ConfigDetailNavigationContext.Provider>
         </main>
       </div>

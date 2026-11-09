@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { isBackendId, type BackendId } from "../session-identity";
 import { isClaudeSessionId, isNativeClaudeSessionId } from "./types";
 
 export interface ClaudeWebMetadataEntry {
@@ -20,7 +21,7 @@ export interface PendingClaudeSideFork {
 
 export interface ClaudeHandoffMetadataEntry {
   sourceSessionId: string;
-  sourceBackend: "pi" | "claude";
+  sourceBackend: BackendId;
   sourceEntryId?: string;
   requestId: string;
   title: string;
@@ -69,7 +70,7 @@ export async function readClaudeWebMetadata(path = claudeMetadataPath()): Promis
       if (!isNativeClaudeSessionId(id) || !value || typeof value !== "object") throw new Error("invalid handoff row");
       const row = value as Partial<ClaudeHandoffMetadataEntry>;
       if (typeof row.sourceSessionId !== "string" || row.sourceSessionId.length === 0 || row.sourceSessionId.length > 200
-        || (row.sourceBackend !== "pi" && row.sourceBackend !== "claude")
+        || !isBackendId(row.sourceBackend)
         || (row.sourceEntryId !== undefined && (typeof row.sourceEntryId !== "string" || row.sourceEntryId.length > 200))
         || typeof row.requestId !== "string" || !isNativeClaudeSessionId(row.requestId)
         || typeof row.title !== "string" || row.title.length > 500
@@ -200,7 +201,7 @@ export function recordClaudeHandoff(
 ): Promise<void> {
   if (!isNativeClaudeSessionId(nativeId)
     || typeof entry.sourceSessionId !== "string" || entry.sourceSessionId.length === 0 || entry.sourceSessionId.length > 200
-    || (entry.sourceBackend !== "pi" && entry.sourceBackend !== "claude")
+    || !isBackendId(entry.sourceBackend)
     || (entry.sourceEntryId !== undefined && (typeof entry.sourceEntryId !== "string" || entry.sourceEntryId.length > 200))
     || !isNativeClaudeSessionId(entry.requestId)
     || typeof entry.title !== "string" || entry.title.length > 500) {

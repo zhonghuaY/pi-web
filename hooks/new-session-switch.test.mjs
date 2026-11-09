@@ -50,6 +50,7 @@ async function sendAndSwitch(stage) {
     session: null,
     newSessionCwd: "/project",
     newSessionDraftKey: "new:draft",
+    t: (key) => key,
     onSessionCreated: (session) => created.push(session.id),
   });
   await settle();

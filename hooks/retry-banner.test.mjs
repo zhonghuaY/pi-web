@@ -3,6 +3,9 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 import { Script, createContext } from "node:vm";
 import ts from "typescript";
+import { isolateClaudeHome } from "../lib/claude-test-home.mjs";
+
+await isolateClaudeHome();
 
 const source = ts.createSourceFile("useAgentSession.ts", await readFile(new URL("./useAgentSession.ts", import.meta.url), "utf8"), ts.ScriptTarget.Latest, true);
 const nodes = [];
@@ -21,6 +24,7 @@ function setup() {
   const banner = { current: null };
   const context = createContext({
     agentRunningRef: { current: true }, sdkAgentActiveRef: { current: true }, sessionIdRef: { current: null },
+    unknownStreamIdsRef: { current: new Set() },
     setRetryInfo: (value) => { banner.current = value; },
     cancelEventStreamGrace() {}, setAgentRunning() {}, setAgentPhase() {}, dispatch() {}, markPromptLanded() {},
   });

@@ -1,4 +1,4 @@
-import type { SessionInfo } from "./types";
+import type { SessionContext, SessionInfo } from "./types";
 import type { SessionSearchResponse, SessionSearchResult } from "./session-search";
 
 function snippet(text: string, query: string) {
@@ -12,19 +12,42 @@ function snippet(text: string, query: string) {
 }
 
 export async function searchClaudeSessions(sessions: SessionInfo[], query: string, signal: AbortSignal): Promise<SessionSearchResponse> {
-  const response: SessionSearchResponse = { results: [], truncated: false };
-  if (!query.trim() || !sessions.length || signal.aborted) return response;
+  if (!query.trim() || !sessions.length || signal.aborted) return { results: [], truncated: false };
   const { readClaudeSession } = await import("./agent-backends/claude");
+  return searchProjectedSessions(sessions, query, signal, (id) => readClaudeSession(id, { tail: 1000 }));
+}
+
+export type ProjectedSearchProgress = {
+  nextIndex: number;
+  results: SessionSearchResult[];
+  truncated: boolean;
+};
+
+export async function searchProjectedSessions(
+  sessions: SessionInfo[],
+  query: string,
+  signal: AbortSignal,
+  read: (id: string) => Promise<{ context: SessionContext }>,
+  progress?: ProjectedSearchProgress,
+): Promise<SessionSearchResponse & { progress?: ProjectedSearchProgress }> {
+  const response: SessionSearchResponse = { results: [...(progress?.results ?? [])], truncated: progress?.truncated ?? false };
+  if (!query.trim() || !sessions.length || signal.aborted) return response;
   const deadline = Date.now() + 3000;
-  const candidates = sessions.filter((s) => s.relation?.kind !== "side").sort((a, b) => b.modified.localeCompare(a.modified));
-  for (const session of candidates) {
-    if (signal.aborted || Date.now() >= deadline || response.results.length >= 30) {
+  const candidates = progress ? sessions : sessions.filter((s) => s.relation?.kind !== "side").sort((a, b) => b.modified.localeCompare(a.modified));
+  for (let index = progress?.nextIndex ?? 0; index < candidates.length; index++) {
+    if (signal.aborted || response.results.length >= 30) {
       response.truncated = true;
       break;
     }
+    if (Date.now() >= deadline) {
+      if (progress) return { ...response, truncated: true, progress: { nextIndex: index, results: response.results, truncated: response.truncated } };
+      response.truncated = true;
+      break;
+    }
+    const session = candidates[index];
     let hit: SessionSearchResult | undefined;
     try {
-      const { context } = await readClaudeSession(session.id, { tail: 1000 });
+      const { context } = await read(session.id);
       response.truncated ||= context.hasMore;
       for (const [index, message] of context.messages.entries()) {
         if (message.role !== "user" && message.role !== "assistant") continue;

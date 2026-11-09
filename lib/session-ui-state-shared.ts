@@ -7,9 +7,11 @@
 // both sides apply, so the client can apply a change optimistically exactly as
 // the server will. Client-safe: no Node imports.
 
+import { parseSessionKey, validateSessionKeyString } from "./session-identity";
+
 export const SESSION_UI_STATE_VERSION = 1;
-/** The session ids pi writes (UUIDs); same as `lib/session-reader.ts`. */
-export const SESSION_ID_PATTERN = /^(?:[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?|claude:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i;
+/** The accepted request grammar is maintained by the session identity module. */
+export const SESSION_ID_PATTERN = { test: validateSessionKeyString };
 export const MAX_SESSION_UI_IDS_PER_REQUEST = 500;
 /** Longest projectKey or project root a request or the file may carry. */
 const MAX_PROJECT_STRING_LENGTH = 4096;
@@ -205,7 +207,13 @@ export function normalizeSessionUiState(value: unknown): SessionUiState | null {
   const revision = value.revision;
   if (typeof revision === "number" && Number.isSafeInteger(revision) && revision >= 0) state.revision = revision;
   for (const [id, entry] of Object.entries(value.sessions ?? {})) {
-    if (!isSessionId(id)) continue;
+    if (!isSessionId(id)) {
+      const parsed = parseSessionKey(id);
+      if (!parsed.ok && parsed.reason === "unknown-namespace") {
+        Object.defineProperty(state.sessions, id, { value: entry, enumerable: true, writable: true, configurable: true });
+      }
+      continue;
+    }
     const family = normalizeFamily(entry);
     if (family) state.sessions[id] = family;
   }

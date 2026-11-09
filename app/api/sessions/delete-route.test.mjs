@@ -5,6 +5,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { createJiti } from "jiti";
+import { isolatePiHome } from "../../../lib/claude-test-home.mjs";
+
+await isolatePiHome();
 
 const jiti = createJiti(import.meta.url, {
   alias: { "@": process.cwd() },

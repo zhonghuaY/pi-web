@@ -1,3 +1,4 @@
+import { sessions } from "@/lib/backend-service";
 import { existsSync } from "fs";
 import { stat } from "fs/promises";
 import { resolve } from "path";
@@ -110,6 +111,10 @@ const EMPTY_MODELS: ModelsData = {
 
 export async function GET(req: Request) {
   const url = new URL(req.url);
+  if (url.searchParams.get("backend") === "codex") {
+    const result = await sessions.models({ backend: "codex", cwd: url.searchParams.get("cwd") ?? "", ...(url.searchParams.get("sessionId") ? { sessionId: url.searchParams.get("sessionId")! } : {}) });
+    return Response.json(result.body, { status: result.status });
+  }
   const requestedCwd = resolve(url.searchParams.get("cwd") || process.cwd());
   const scopeAll = url.searchParams.get("scope") === "all";
   // A subagent run isolated in a worktree has that worktree removed when the run

@@ -5,9 +5,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { createJiti } from "jiti";
-import { isolateClaudeHome } from "../../../lib/claude-test-home.mjs";
+import { isolateClaudeHome, isolatePiHome } from "../../../lib/claude-test-home.mjs";
 
 await isolateClaudeHome();
+await isolatePiHome();
 
 const routeSource = await readFile(new URL("./[id]/fork/route.ts", import.meta.url), "utf8");
 const jiti = createJiti(import.meta.url, {

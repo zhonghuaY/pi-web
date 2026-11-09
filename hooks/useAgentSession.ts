@@ -21,6 +21,7 @@ import {
   answerAgentInteraction,
   canLoadAgentSlashCommands,
   DEFAULT_AGENT_BACKENDS,
+  NO_CAPABILITIES,
   fetchAgentBackends,
   isAgentInteractionRequest,
   sessionBackend,
@@ -37,6 +38,7 @@ import {
   type PendingAgentInteraction,
 } from "@/lib/agent-backends";
 import { missingCwdFromBody } from "@/lib/missing-cwd";
+import { formatSessionKey, isBackendId, parseSessionKey } from "@/lib/session-identity";
 import {
   deleteSessionViewSnapshot,
   getSessionViewSnapshot,
@@ -51,6 +53,7 @@ import { mergeSessionStats, type SessionFileStats } from "@/lib/session-stats";
 import { formatSessionSummary } from "@/lib/session-stats-format";
 import { userMessageKey } from "@/lib/prompt-recovery";
 import { carryMessageKeys, messageRenderKeys } from "@/lib/message-keys";
+import { isCodexSessionId, isTerminalCodexActivity, mergeCodexHistory, reconcileCodexSnapshot, type CodexSnapshotItem } from "@/lib/codex-reconcile";
 import {
   AgentEventConnection,
   canReleaseHiddenEventStream,
@@ -70,7 +73,7 @@ import { updateExtensionWidgets } from "@/lib/extension-widgets";
 import { bareMcpOpensSettings } from "@/lib/mcp-command";
 import type { SettingsSection } from "@/lib/settings-navigation";
 import { withTranscriptNotices, type TranscriptNotice } from "@/lib/transcript-notices";
-import { validatePiSessionChoices } from "@/lib/agent-session-choices";
+import { CLAUDE_EFFORTS, isClaudeEffort, parseCodexSettings, parseCodexModels, codexSelectionForModel, type CodexEffectiveSettings, type CodexModelChoice, type CodexSelection, type PiThinkingLevel, type NewSessionChoices, type ReasoningChoice, type ReasoningControl, type ReasoningRow, validatePiSessionChoices } from "@/lib/agent-session-choices";
 import {
   enqueueExtensionUiRequest,
   removeExtensionUiRequest,
@@ -85,6 +88,7 @@ import {
 } from "@/lib/chat-lazy-load";
 import {
   createStreamingStore,
+  DEFAULT_STREAM_KEY,
   type ClientAssistantMessageEvent,
 } from "@/lib/streaming-message";
 
@@ -133,6 +137,7 @@ interface LastAssistantTextResponse {
 
 type AgentStateResponse = {
   model?: { provider: string; id: string };
+  settings?: CodexEffectiveSettings;
   contextUsage?: { percent: number | null; contextWindow: number; tokens: number | null } | null;
   /** Active time over the live wrapper's entries (the snapshot carries the same field). */
   totalActiveMs?: number;
@@ -196,6 +201,12 @@ export type AgentPhase =
   | { kind: "running_command" }
   | { kind: "running_tools"; tools: { id: string; name: string; progress?: string }[] }
   | null;
+
+function codexActivityToolName(message: AgentMessage | undefined): string | null {
+  if (message?.role === "bashExecution") return "bash";
+  if (message?.role === "custom" && ["fileChange", "mcpToolCall", "dynamicToolCall"].includes(message.customType)) return message.customType;
+  return null;
+}
 
 export interface CompactResultInfo {
   reason: "manual" | "threshold" | "overflow" | "auto" | string;
@@ -271,7 +282,7 @@ export interface UseAgentSessionOptions {
   t: (key: string, params?: TranslationParams) => string;
 }
 
-export type ThinkingLevelOption = "auto" | "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+export type ThinkingLevelOption = PiThinkingLevel | "auto";
 type ConcreteThinkingLevel = Exclude<ThinkingLevelOption, "auto">;
 const CONCRETE_THINKING_LEVELS = new Set<ConcreteThinkingLevel>(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 
@@ -281,11 +292,7 @@ const CONCRETE_THINKING_LEVELS = new Set<ConcreteThinkingLevel>(["off", "minimal
  * go along with the draft. (The tool preset needs no carrying: a pick is the
  * browser's preference, which every fresh composer starts from.)
  */
-export interface NewSessionChoices {
-  backend: AgentBackend;
-  model: { provider: string; modelId: string } | null;
-  thinkingLevel: ConcreteThinkingLevel | null;
-}
+export type { NewSessionChoices } from "@/lib/agent-session-choices";
 
 function asConcreteThinkingLevel(value?: string | null): ConcreteThinkingLevel | null {
   return value && CONCRETE_THINKING_LEVELS.has(value as ConcreteThinkingLevel)
@@ -469,33 +476,30 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-export function handoffSessionFromResponse(value: unknown): SessionInfo | null {
-  if (!isRecord(value) || !isRecord(value.data) || !isRecord(value.data.session)) return null;
+export function handoffSessionFromResponse(value: unknown, identity: HandoffRequestIdentity): SessionInfo | null {
+  if (!isRecord(value) || value.success !== true || !isRecord(value.data) || !isRecord(value.data.session)) return null;
   const session = value.data.session;
   if (typeof session.id !== "string" || typeof session.cwd !== "string"
     || typeof session.path !== "string" || typeof session.created !== "string"
     || typeof session.modified !== "string" || typeof session.firstMessage !== "string"
     || typeof session.messageCount !== "number") return null;
-  const backend = session.backend === "pi" || session.backend === "claude" ? session.backend : undefined;
+  const sourceKey = parseSessionKey(identity.sourceSessionId);
+  const targetKey = parseSessionKey(session.id);
   const relationSource = session.relation;
-  const relationBackend: AgentBackend | null = isRecord(relationSource)
-    && (relationSource.sourceBackend === "pi" || relationSource.sourceBackend === "claude")
-    ? relationSource.sourceBackend
-    : null;
-  const relation = isRecord(relationSource)
-    && relationSource.kind === "handoff"
-    && typeof relationSource.sourceSessionId === "string"
-    && relationBackend !== null
-    && typeof relationSource.requestId === "string"
-    && (relationSource.sourceEntryId === undefined || typeof relationSource.sourceEntryId === "string")
-    ? {
-        kind: "handoff" as const,
-        sourceSessionId: relationSource.sourceSessionId,
-        sourceBackend: relationBackend,
-        ...(typeof relationSource.sourceEntryId === "string" ? { sourceEntryId: relationSource.sourceEntryId } : {}),
-        requestId: relationSource.requestId,
-      }
-    : undefined;
+  if (!sourceKey.ok || !targetKey.ok || formatSessionKey(targetKey.key) !== session.id
+    || targetKey.key.backend !== identity.targetBackend || !isBackendId(session.backend) || session.backend !== identity.targetBackend
+    || !isRecord(relationSource) || relationSource.kind !== "handoff"
+    || relationSource.sourceSessionId !== identity.sourceSessionId
+    || !isBackendId(relationSource.sourceBackend) || relationSource.sourceBackend !== sourceKey.key.backend
+    || relationSource.requestId !== identity.requestId
+    || (relationSource.sourceEntryId !== undefined && typeof relationSource.sourceEntryId !== "string")) return null;
+  const relation = {
+    kind: "handoff" as const,
+    sourceSessionId: relationSource.sourceSessionId,
+    sourceBackend: relationSource.sourceBackend,
+    ...(typeof relationSource.sourceEntryId === "string" ? { sourceEntryId: relationSource.sourceEntryId } : {}),
+    requestId: relationSource.requestId,
+  };
   return {
     id: session.id,
     cwd: session.cwd,
@@ -505,21 +509,81 @@ export function handoffSessionFromResponse(value: unknown): SessionInfo | null {
     firstMessage: session.firstMessage,
     messageCount: session.messageCount,
     ...(typeof session.name === "string" ? { name: session.name } : {}),
-    ...(backend ? { backend } : {}),
+    backend: session.backend,
     ...(typeof session.projectRoot === "string" ? { projectRoot: session.projectRoot } : {}),
     ...(typeof session.projectKey === "string" ? { projectKey: session.projectKey } : {}),
     ...(typeof session.branch === "string" ? { branch: session.branch } : {}),
     ...(session.isWorktree === true ? { isWorktree: true } : {}),
     ...(session.transient === true ? { transient: true } : {}),
-    ...(relation ? { relation } : {}),
+    relation,
   };
 }
 
-function handoffErrorFromResponse(value: unknown, fallback: string): string {
-  return isRecord(value) && typeof value.error === "string" ? value.error : fallback;
+class HandoffRequestFailure extends Error {
+  constructor(message: string, readonly reason: string | null, readonly operationId: string | null) {
+    super(message);
+    this.name = "HandoffRequestFailure";
+  }
 }
 
-const CLAUDE_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
+function handoffFailureFromResponse(value: unknown, fallback: string): HandoffRequestFailure {
+  return new HandoffRequestFailure(
+    isRecord(value) && typeof value.error === "string" ? value.error : fallback,
+    isRecord(value) && typeof value.reason === "string" ? value.reason : null,
+    isRecord(value) && typeof value.operationId === "string" ? value.operationId : null,
+  );
+}
+
+export async function requestSessionHandoff(sourceSessionId: string, targetBackend: AgentBackend, requestId: string, trustProject: boolean): Promise<SessionInfo> {
+  let response: Response;
+  let body: unknown;
+  try {
+    response = await fetch("/api/sessions/" + encodeURIComponent(sourceSessionId) + "/handoff", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ targetBackend, requestId, ...(trustProject ? { trustProject: true } : {}) }),
+    });
+    body = await response.json();
+  } catch (error) {
+    throw new HandoffRequestFailure(error instanceof Error ? error.message : String(error), "outcome-unknown", requestId);
+  }
+  if (!response.ok) {
+    const failure = handoffFailureFromResponse(body, "HTTP " + response.status);
+    if (!isRecord(body) || typeof body.error !== "string" || (response.status >= 500 && !failure.reason)
+      || failure.reason === "outcome-unknown"
+      || (failure.reason === "source-conflict" && (response.status !== 409 || failure.operationId !== requestId))) {
+      throw new HandoffRequestFailure(failure.message, "outcome-unknown", requestId);
+    }
+    throw failure;
+  }
+  const target = handoffSessionFromResponse(body, { sourceSessionId, targetBackend, requestId });
+  if (!target) {
+    throw new HandoffRequestFailure("Invalid handoff response", "outcome-unknown", requestId);
+  }
+  return target;
+}
+
+function handoffStorageKey(sourceSessionId: string, targetBackend: AgentBackend): string {
+  return "pi-web:handoff-request:" + JSON.stringify([sourceSessionId, targetBackend]);
+}
+
+export function pendingHandoffRequestId(sourceSessionId: string, targetBackend: AgentBackend, create: () => string): string {
+  let requestId: string | null = null;
+  try { requestId = sessionStorage.getItem(handoffStorageKey(sourceSessionId, targetBackend)); } catch { /* storage may be unavailable */ }
+  if (requestId && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(requestId)) return requestId;
+  requestId = create();
+  try { sessionStorage.setItem(handoffStorageKey(sourceSessionId, targetBackend), requestId); } catch { /* the mounted hook still retains the id */ }
+  return requestId;
+}
+
+export function clearPendingHandoffRequestId(sourceSessionId: string, targetBackend: AgentBackend, requestId: string): void {
+  try {
+    const key = handoffStorageKey(sourceSessionId, targetBackend);
+    if (sessionStorage.getItem(key) === requestId) sessionStorage.removeItem(key);
+  } catch { /* storage may be unavailable */ }
+}
+
+const CLAUDE_EFFORT_LEVELS = CLAUDE_EFFORTS;
 const CLAUDE_FALLBACK_MODELS = [
   { id: "sonnet", name: "Sonnet" },
   { id: "opus", name: "Opus" },
@@ -535,7 +599,17 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
 
   const isNew = session === null && newSessionCwd !== null;
   const initialChoices = isNew ? opts.initialNewSessionChoices ?? null : null;
-  const [backend, setBackend] = useState<AgentBackend>(() => session ? sessionBackend(session) : initialChoices?.backend ?? "pi");
+  const initialModel = initialChoices?.backend === "pi" ? initialChoices.model
+    : initialChoices?.backend === "claude" && initialChoices.modelId ? { provider: "claude", modelId: initialChoices.modelId } : null;
+  const initialThinking = initialChoices?.backend === "pi" ? initialChoices.thinkingLevel : initialChoices?.backend === "claude" ? initialChoices.effort : null;
+  const [codexDraft, setCodexDraft] = useState<CodexSelection | null>(() => initialChoices?.backend === "codex" ? initialChoices.selection : null);
+  const codexDraftRef = useRef(codexDraft);
+  const [codexSettings, setCodexSettings] = useState<CodexEffectiveSettings | null>(null);
+  const codexSettingsRef = useRef(codexSettings);
+  codexSettingsRef.current = codexSettings;
+  const [codexModelChoices, setCodexModelChoices] = useState<CodexModelChoice[]>([]);
+  const modelsGenerationRef = useRef(0);
+  const [backend, setBackend] = useState<AgentBackend>(() => sessionBackend(session) ?? initialChoices?.backend ?? "pi");
   const [backends, setBackends] = useState<AgentBackends>(DEFAULT_AGENT_BACKENDS);
   const [backendsLoading, setBackendsLoading] = useState(isNew);
   const [backendsError, setBackendsError] = useState<string | null>(null);
@@ -545,7 +619,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const backendRef = useRef<AgentBackend>(backend);
   backendRef.current = backend;
   const capabilities = useMemo(
-    () => session ? sessionCapabilities(session) : backends[backend].capabilities,
+    () => session ? sessionCapabilities(session) : backends[backend]?.capabilities ?? NO_CAPABILITIES,
     [backend, backends, session],
   );
 
@@ -563,6 +637,9 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const [earlierTurnCount, setEarlierTurnCount] = useState(0);
   // Outside React state: a streamed chunk must not re-render the whole chat (see StreamingStore).
   const [streamingStore] = useState(createStreamingStore);
+  const liveMessageIdsRef = useRef(new WeakMap<AgentMessage, string>());
+  const liveMessageKeysRef = useRef(new WeakMap<AgentMessage, string>());
+  const unknownStreamIdsRef = useRef(new Set<string>());
   const dispatch = streamingStore.dispatch;
   const [agentRunning, setAgentRunning] = useState(false);
   const [bashRunning, setBashRunning] = useState(false);
@@ -584,10 +661,10 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const allModelsLoadRef = useRef<object | null>(null);
   const [modelThinkingLevels, setModelThinkingLevels] = useState<Record<string, string[]>>({});
   const [modelThinkingLevelMaps, setModelThinkingLevelMaps] = useState<Record<string, Record<string, string | null>>>({});
-  const [newSessionModel, setNewSessionModel] = useState<SelectedModel | null>(() => initialChoices?.model ?? null);
+  const [newSessionModel, setNewSessionModel] = useState<SelectedModel | null>(() => initialModel);
   const [newSessionDefaultModel, setNewSessionDefaultModel] = useState<SelectedModel | null>(null);
   const [toolPreset, setToolPreset] = useState<ToolPreset>(CONFIGURED_TOOL_PRESET);
-  const [newSessionThinkingLevel, setNewSessionThinkingLevel] = useState<ConcreteThinkingLevel | null>(() => initialChoices?.thinkingLevel ?? null);
+  const [newSessionThinkingLevel, setNewSessionThinkingLevel] = useState<ConcreteThinkingLevel | null>(() => initialThinking);
   const [newSessionDefaultThinkingLevel, setNewSessionDefaultThinkingLevel] = useState<ConcreteThinkingLevel | null>(null);
   const [savedDefaultThinkingLevel, setSavedDefaultThinkingLevel] = useState<ConcreteThinkingLevel | null>(null);
   const [currentThinkingOverride, setCurrentThinkingOverride] = useState<ConcreteThinkingLevel | null>(null);
@@ -623,6 +700,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const [agentInteractions, setAgentInteractions] = useState<PendingAgentInteraction[]>([]);
   const [pendingClaudeTrustSubmission, setPendingClaudeTrustSubmission] = useState<PendingClaudeTrustAction | null>(null);
   const [handoffSwitching, setHandoffSwitching] = useState(false);
+  const [handoffTargetBackend, setHandoffTargetBackend] = useState<AgentBackend | null>(null);
   const handoffRequestRef = useRef<HandoffRequestIdentity | null>(null);
   const claudeProjectTrustConfirmedRef = useRef(false);
   const [extensionCustomUis, setExtensionCustomUis] = useState<ExtensionUiCustomRequest[]>([]);
@@ -689,8 +767,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const slashCommandsLoadRef = useRef<Promise<SlashCommandInfo[] | null> | null>(null);
   const slashCommandsGenerationRef = useRef(0);
   const newSessionPromotedRef = useRef(false);
-  const newSessionModelOverrideRef = useRef<SelectedModel | null>(initialChoices?.model ?? null);
-  const thinkingLevelOverrideRef = useRef<ConcreteThinkingLevel | null>(initialChoices?.thinkingLevel ?? null);
+  const newSessionModelOverrideRef = useRef<SelectedModel | null>(initialModel);
+  const thinkingLevelOverrideRef = useRef<ConcreteThinkingLevel | null>(initialThinking);
   const thinkingLevelPinsRef = useRef<Record<string, string>>({});
   const defaultThinkingLevelRef = useRef<ConcreteThinkingLevel | null>(null);
   const promptRunIdRef = useRef(0);
@@ -793,9 +871,23 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const retryBackendDiscovery = useCallback(() => setBackendDiscoveryAttempt((attempt) => attempt + 1), []);
 
   const handleBackendChange = useCallback((next: AgentBackend) => {
-    if (!isNew || sessionIdRef.current || !backends[next].available) return;
+    if (!isNew || sessionIdRef.current || !backends[next]?.available) return;
     backendRef.current = next;
-    if (next === "claude") {
+    modelsGenerationRef.current += 1;
+    codexDraftRef.current = null;
+    setCodexDraft(null);
+    setCodexSettings(null);
+    setCodexModelChoices([]);
+    setNewSessionDefaultModel(null);
+    setNewSessionDefaultThinkingLevel(null);
+    setModelList([]);
+    setModelNames({});
+    if (next === "codex" || backend === "codex") {
+      newSessionModelOverrideRef.current = null;
+      thinkingLevelOverrideRef.current = null;
+      setNewSessionModel(null);
+      setNewSessionThinkingLevel(null);
+    } else if (next === "claude") {
       if (newSessionModelOverrideRef.current?.provider !== "claude") {
         newSessionModelOverrideRef.current = null;
         setNewSessionModel(null);
@@ -807,12 +899,16 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       }
     }
     setBackend(next);
-  }, [backends, isNew]);
+  }, [backend, backends, isNew]);
 
   const onNewSessionChoicesChange = opts.onNewSessionChoicesChange;
   useEffect(() => {
-    if (isNew) onNewSessionChoicesChange?.({ backend, model: newSessionModel, thinkingLevel: newSessionThinkingLevel });
-  }, [backend, isNew, newSessionModel, newSessionThinkingLevel, onNewSessionChoicesChange]);
+    if (!isNew) return;
+    const choices: NewSessionChoices = backend === "codex" ? { backend, selection: codexDraft }
+      : backend === "claude" ? { backend, modelId: newSessionModel?.modelId ?? null, effort: isClaudeEffort(newSessionThinkingLevel) ? newSessionThinkingLevel : null }
+      : { backend, model: newSessionModel, thinkingLevel: newSessionThinkingLevel };
+    onNewSessionChoicesChange?.(choices);
+  }, [backend, codexDraft, isNew, newSessionModel, newSessionThinkingLevel, onNewSessionChoicesChange]);
 
   useEffect(() => {
     if (backend === "claude" && backends.claude.claude?.model) setEffectiveNativeModel(backends.claude.claude.model);
@@ -833,8 +929,10 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     previousScrollTopRef.current = container.scrollTop;
   }, []);
 
-  const currentModel = currentModelOverride ?? liveModel ?? data?.context.model ?? pendingModel ?? null;
-  const displayModel = isNew
+  const legacyCurrentModel = currentModelOverride ?? liveModel ?? data?.context.model ?? pendingModel ?? null;
+  const currentModel = useMemo(() => backend === "codex" ? (codexSettings ? { provider: "codex", modelId: codexSettings.model } : null) : legacyCurrentModel, [backend, codexSettings, legacyCurrentModel]);
+  const codexDraftModel = useMemo(() => codexDraft ? { provider: "codex", modelId: codexDraft.model } : null, [codexDraft]);
+  const displayModel = backend === "codex" ? (codexDraftModel && isNew && !sessionIdRef.current ? codexDraftModel : currentModel) : isNew
     ? (newSessionModel ?? newSessionDefaultModel)
     : currentModel ?? (data?.context.messages.length === 0 ? newSessionDefaultModel : null);
   const contextThinkingLevel = asConcreteThinkingLevel(
@@ -849,6 +947,11 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const composerDraftKey = session?.id ?? newSessionDraftKey ?? undefined;
 
   const syncLiveModel = useCallback((state?: AgentStateResponse) => {
+    if (backendRef.current === "codex") {
+      const settings = parseCodexSettings(state?.settings);
+      if (settings) { codexSettingsRef.current = settings; setCodexSettings(settings); }
+      return;
+    }
     if (backendRef.current === "claude" && state?.model?.id) setEffectiveNativeModel(state.model.id);
     setLiveModel(state?.model
       ? { provider: state.model.provider, modelId: state.model.id }
@@ -1044,10 +1147,12 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
           loadedEntryIds: entryIdsRef.current,
         });
       } else {
-        const previous = { messages: messagesRef.current, entryIds: entryIdsRef.current };
+        const previous = { messages: messagesRef.current, entryIds: entryIdsRef.current, liveIds: messagesRef.current.map(message => liveMessageIdsRef.current.get(message) ?? null), stickyKeys: liveMessageKeysRef.current };
         const next = { messages: persistedMessages, entryIds: d.context.entryIds ?? [] };
         setMessageKeyAliases((aliases) => carryMessageKeys({ ...previous, aliases }, next));
-        setMessages(next.messages);
+        setMessages(isCodexSessionId(sid) && agentRunningRef.current
+          ? mergeCodexHistory(previous, next, liveMessageIdsRef.current)
+          : next.messages);
         setEntryIds(next.entryIds);
         setHistoryCursor(d.context.oldestEntryId);
         setHasEarlierMessages(d.context.hasMore);
@@ -1226,6 +1331,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       // Only send explicit user overrides. The server resolves the current
       // enabledModels scope atomically with AgentSession construction.
       const isPi = backendRef.current === "pi";
+      const isCodex = backendRef.current === "codex";
+      const nativeSelection = codexDraftRef.current;
       const selectedModel = newSessionModelOverrideRef.current;
       const selectedThinkingLevel = thinkingLevelOverrideRef.current;
       if (selectedModel) setPendingModel(selectedModel);
@@ -1245,30 +1352,32 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
           type: "ensure_session",
           requestId,
           ...(toolNames !== undefined ? { toolNames } : {}),
-          ...(selectedModel ? (isPi
+          ...(isCodex ? (nativeSelection ?? {}) : {}),
+          ...(!isCodex && selectedModel ? (isPi
             ? { provider: selectedModel.provider, modelId: selectedModel.modelId }
             : { modelId: selectedModel.modelId }) : {}),
-          ...(selectedThinkingLevel ? (isPi
+          ...(!isCodex && selectedThinkingLevel ? (isPi
             ? { thinkingLevel: selectedThinkingLevel }
             : { effort: selectedThinkingLevel }) : {}),
-          ...(!isPi && claudeProjectTrustConfirmedRef.current ? { trustProject: true } : {}),
+          ...(backendRef.current === "claude" && claudeProjectTrustConfirmedRef.current ? { trustProject: true } : {}),
         }),
       });
       if (!res.ok) {
         // The server's reason (a project folder that no longer exists, a model Chat only
         // cannot load) beats a bare status.
-        const body = await res.json().catch(() => null) as { error?: unknown } | null;
+        const body = await res.json().catch(() => null) as { error?: unknown; code?: unknown } | null;
         const message = typeof body?.error === "string" ? body.error : `HTTP ${res.status}`;
         const cwdGone = missingCwdFromBody(body);
-        throw cwdGone ? new AgentCommandError(message, res.status, undefined, undefined, cwdGone) : new Error(message);
+        throw new AgentCommandError(message, res.status, typeof body?.code === "string" ? body.code : undefined, undefined, cwdGone ?? undefined);
       }
       const result = await res.json() as {
         sessionId: string;
         model?: SelectedModel | null;
         thinkingLevel?: ThinkingLevelOption;
-        state?: { model?: { provider?: string; id?: string } | null; thinkingLevel?: string };
+        state?: { model?: { provider?: string; id?: string } | null; thinkingLevel?: string; settings?: CodexEffectiveSettings };
       };
       const realId = result.sessionId;
+      if (isCodex) { const settings = parseCodexSettings(result.state?.settings); if (settings) { codexSettingsRef.current = settings; setCodexSettings(settings); } }
       sessionIdRef.current = realId;
       const resultModel = result.model ?? (result.state?.model?.id
         ? { provider: result.state.model.provider ?? "claude", modelId: result.state.model.id }
@@ -1605,57 +1714,66 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     const sourceSessionId = sessionIdRef.current;
     if (!session || sourceSessionId !== session.id || handoffSwitching) return;
     setHandoffSwitching(true);
+    setHandoffTargetBackend(targetBackend);
     try {
-      const response = await fetch("/api/sessions/" + encodeURIComponent(sourceSessionId) + "/handoff", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ targetBackend, requestId, ...(trustProject ? { trustProject: true } : {}) }),
-      });
-      const body: unknown = await response.json().catch(() => null);
-      if (!response.ok) throw new Error(handoffErrorFromResponse(body, "HTTP " + response.status));
-      const target = handoffSessionFromResponse(body);
-      if (!target || (target.backend !== undefined && target.backend !== targetBackend)) {
-        throw new Error("Invalid handoff response");
+      const target = await requestSessionHandoff(sourceSessionId, targetBackend, requestId, trustProject);
+      clearPendingHandoffRequestId(sourceSessionId, targetBackend, requestId);
+      const pending = handoffRequestRef.current;
+      if (pending?.sourceSessionId === sourceSessionId && pending.targetBackend === targetBackend && pending.requestId === requestId) {
+        handoffRequestRef.current = null;
       }
-      handoffRequestRef.current = null;
       if (sessionHookMountedRef.current && sessionIdRef.current === sourceSessionId) {
         onSessionHandoff?.(sourceSessionId, {
           ...target,
-          backend: targetBackend,
-          capabilities: backends[targetBackend].capabilities,
-          relation: target.relation ?? {
-            kind: "handoff",
-            sourceSessionId,
-            sourceBackend: backendRef.current,
-            requestId,
-          },
+          capabilities: backends[targetBackend]?.capabilities ?? NO_CAPABILITIES,
         });
       }
     } catch (error) {
+      const sourceChanged = error instanceof HandoffRequestFailure && error.reason === "source-conflict" && error.operationId === requestId;
+      if (sourceChanged) {
+        clearPendingHandoffRequestId(sourceSessionId, targetBackend, requestId);
+        const pending = handoffRequestRef.current;
+        if (pending?.sourceSessionId === sourceSessionId && pending.targetBackend === targetBackend && pending.requestId === requestId) {
+          handoffRequestRef.current = null;
+        }
+      }
       if (sessionHookMountedRef.current && sessionIdRef.current === sourceSessionId) {
+        const label = targetBackend === "claude" ? "Claude" : targetBackend === "codex" ? "Codex" : "Pi";
+        const outcomeUnknown = error instanceof HandoffRequestFailure && error.reason === "outcome-unknown";
         addNotice({
-          type: "error",
-          message: translate("chat.handoffFailed", {
-            backend: targetBackend === "claude" ? "Claude" : "Pi",
-            error: error instanceof Error ? error.message : String(error),
-          }),
+          type: outcomeUnknown ? "warning" : "error",
+          message: sourceChanged
+            ? translate("chat.handoffSourceChanged", { backend: label })
+            : outcomeUnknown
+            ? translate("chat.handoffUnconfirmed", {
+                backend: label,
+                operationId: error.operationId ?? requestId,
+                error: error.message,
+              })
+            : translate("chat.handoffFailed", {
+                backend: label,
+                error: error instanceof Error ? error.message : String(error),
+              }),
         });
       }
     } finally {
-      if (sessionHookMountedRef.current) setHandoffSwitching(false);
+      if (sessionHookMountedRef.current) {
+        setHandoffSwitching(false);
+        setHandoffTargetBackend(null);
+      }
     }
   }, [addNotice, backends, handoffSwitching, onSessionHandoff, session, translate]);
 
   const handleSessionHandoff = useCallback((targetBackend: AgentBackend) => {
     const sourceSessionId = sessionIdRef.current;
     if (!session || sourceSessionId !== session.id || targetBackend === backendRef.current || handoffSwitching) return;
-    if (!backends[targetBackend].available) {
-      addNotice({ type: "error", message: backends[targetBackend].reason ?? translate("chat.backendUnavailable") });
+    if (!backends[targetBackend]?.available) {
+      addNotice({ type: "error", message: backends[targetBackend]?.reason ?? translate("chat.backendUnavailable") });
       return;
     }
     let identity = handoffRequestRef.current;
     if (!identity || identity.sourceSessionId !== sourceSessionId || identity.targetBackend !== targetBackend) {
-      identity = { sourceSessionId, targetBackend, requestId: createRequestId() };
+      identity = { sourceSessionId, targetBackend, requestId: pendingHandoffRequestId(sourceSessionId, targetBackend, createRequestId) };
       handoffRequestRef.current = identity;
     }
     if (targetBackend === "claude" && !claudeProjectTrustConfirmedRef.current) {
@@ -2033,7 +2151,15 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   }, [agentRunning]);
 
   const handleAgentEvent = useCallback((event: AgentEvent) => {
+    const setMessagePhase = (next: AgentPhase) => setAgentPhase(prev =>
+      backendRef.current === "codex" && prev?.kind === "running_tools" ? prev : next);
     switch (event.type) {
+      case "session_settings": {
+        if (backendRef.current !== "codex") break;
+        const settings = parseCodexSettings(event.settings);
+        if (settings) { codexSettingsRef.current = settings; setCodexSettings(settings); }
+        break;
+      }
       case "connected": {
         dispatch({ type: "end" });
         if (Array.isArray(event.pendingExtensionUiIds)) {
@@ -2051,14 +2177,32 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
           ));
         }
         if (event.isStreaming === true) {
+          const snapshot = event.turnSnapshot as { items?: CodexSnapshotItem[] } | undefined;
+          const tools: { id: string; name: string }[] = [];
+          if (Array.isArray(snapshot?.items)) {
+            const items = snapshot.items.filter((item): item is CodexSnapshotItem =>
+              typeof item?.id === "string" && typeof item.completed === "boolean"
+              && (item.message?.role === "assistant" || (backendRef.current === "codex" && codexActivityToolName(item.message) !== null)),
+            ).map(item => ({ ...item, message: normalizeToolCalls(item.message) }));
+            const terminalIds = new Set<string>();
+            if (backendRef.current === "codex") messagesRef.current.forEach((message, index) => {
+              const id = entryIdsRef.current[index] ?? liveMessageIdsRef.current.get(message);
+              if (id && isTerminalCodexActivity(message)) terminalIds.add(id);
+            });
+            setMessages(previous => reconcileCodexSnapshot(previous, entryIdsRef.current, liveMessageIdsRef.current, liveMessageKeysRef.current, items));
+            for (const item of items) {
+              if (item.completed || terminalIds.has(item.id)) continue;
+              const name = backendRef.current === "codex" ? codexActivityToolName(item.message) : null;
+              if (name) tools.push({ id: item.id, name });
+              else if (item.message.role === "assistant") dispatch({ type: "snapshot", key: item.id, message: item.message });
+            }
+          }
           cancelEventStreamGrace();
           sdkAgentActiveRef.current = true;
           agentRunningRef.current = true;
           setAgentRunning(true);
-          // The server replays every tool call still running right after this
-          // event, so start from none: a call that ended while the stream was
-          // down must not stay listed.
-          setAgentPhase({ kind: "waiting_model" });
+          // Pi replays running tools after connected; Codex includes them in its snapshot.
+          setAgentPhase(tools.length ? { kind: "running_tools", tools } : { kind: "waiting_model" });
         }
         // Opening the stream is what resumes an idle-reaped session, so the
         // mount's state read may have found no runtime and no usage to show.
@@ -2066,6 +2210,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         break;
       }
       case "agent_start":
+        unknownStreamIdsRef.current.clear();
         markPromptLanded();
         cancelEventStreamGrace();
         sdkAgentActiveRef.current = true;
@@ -2168,17 +2313,34 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
           const msg = event.message as AgentMessage | undefined;
           if (msg?.role === "user") break;
           if (msg?.role === "assistant") {
-            dispatch({ type: "snapshot", message: msg });
-            if (msg.content.length > 0) setAgentPhase(null);
+            const id = typeof event.entryId === "string" ? event.entryId : undefined;
+            if (id && isCodexSessionId(sessionIdRef.current)) {
+              const placeholder = normalizeToolCalls(msg);
+              liveMessageIdsRef.current.set(placeholder, id);
+              setMessages(previous => {
+                if (entryIdsRef.current.includes(id) || previous.some(item => liveMessageIdsRef.current.get(item) === id)) return previous;
+                return [...previous, placeholder];
+              });
+            }
+            dispatch({ type: "snapshot", message: msg, ...(id ? { key: id } : {}) });
+            if (msg.content.length > 0) setMessagePhase(null);
           } else if (msg) {
-            setAgentPhase(null);
+            setMessagePhase(null);
           }
         } else {
           const delta = event.assistantMessageEvent as ClientAssistantMessageEvent | undefined;
           if (delta) {
-            dispatch({ type: "delta", event: delta });
+            const key = typeof event.entryId === "string" ? event.entryId : DEFAULT_STREAM_KEY;
+            if (key !== DEFAULT_STREAM_KEY && !streamingStore.getState().streams.has(key)) {
+              if (!unknownStreamIdsRef.current.has(key)) {
+                unknownStreamIdsRef.current.add(key);
+                addNotice({ type: "error", message: translate("chat.unknownStreamItem") });
+              }
+              break;
+            }
+            dispatch({ type: "delta", event: delta, key });
             if (delta.type !== "toolcall_start" && delta.type !== "toolcall_delta") {
-              setAgentPhase(null);
+              setMessagePhase(null);
             }
           }
         }
@@ -2224,14 +2386,30 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         } else if (completed) {
           // pi's showCacheMissNotices (#1265): the wrapper sends them beside the message.
           const notices = Array.isArray(event.transcriptNotices) ? event.transcriptNotices as TranscriptNotice[] : undefined;
-          setMessages((prev) => [...prev, withTranscriptNotices(normalizeToolCalls(completed), notices)]);
+          const message = withTranscriptNotices(normalizeToolCalls(completed), notices);
+          const id = typeof event.entryId === "string" ? event.entryId : null;
+          if (id) liveMessageIdsRef.current.set(message, id);
+          setMessages((prev) => {
+            if (id && entryIdsRef.current.includes(id)) {
+              const index = entryIdsRef.current.indexOf(id);
+              return prev.map((item, i) => i === index ? message : item);
+            }
+            const index = id ? prev.findIndex(item => liveMessageIdsRef.current.get(item) === id) : -1;
+            if (index < 0) return [...prev, message];
+            const key = liveMessageKeysRef.current.get(prev[index]);
+            if (key) liveMessageKeysRef.current.set(message, key);
+            return prev.map((item, i) => i === index ? message : item);
+          });
           if (completed.role === "assistant") {
             const sid = sessionIdRef.current;
             if (sid) void refreshContextUsage(sid);
           }
         }
-        dispatch({ type: "end" });
-        setAgentPhase({ kind: "waiting_model" });
+        const eventKey = typeof event.entryId === "string" ? event.entryId : DEFAULT_STREAM_KEY;
+        const streams = streamingStore.getState().streams;
+        const closeKey = streams.has(eventKey) ? eventKey : streams.has(DEFAULT_STREAM_KEY) ? DEFAULT_STREAM_KEY : eventKey;
+        dispatch({ type: "close", key: closeKey });
+        setMessagePhase({ kind: "waiting_model" });
         break;
       }
       case "tool_execution_start": {
@@ -2356,7 +2534,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         setExtensionDialogs((queue) => removeExtensionUiRequest(queue, event.id as string));
         break;
     }
-  }, [addNotice, applyLiveUsage, cancelEventStreamGrace, dispatch, handleExtensionUiRequest, loadSession, markPromptLanded, notifyPromptStage, onAgentEnd, onToolEnd, refreshContextUsage, replaceSlashCommands, scheduleEventStreamClose, scrollToBottom, settleUiStage, syncLiveModel]);
+  }, [addNotice, applyLiveUsage, cancelEventStreamGrace, dispatch, handleExtensionUiRequest, loadSession, markPromptLanded, notifyPromptStage, onAgentEnd, onToolEnd, refreshContextUsage, replaceSlashCommands, scheduleEventStreamClose, scrollToBottom, settleUiStage, streamingStore, syncLiveModel, translate]);
   handleAgentEventRef.current = handleAgentEvent;
 
   const handleSend = useCallback(async (message: string, images?: AttachedImage[], existingRequestId?: string) => {
@@ -2399,7 +2577,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
 
     const isBashCommand = !images?.length && trimmedMessage.startsWith("!");
     if (isBashCommand && backendRef.current !== "pi") {
-      addNotice({ type: "error", message: "Shell commands are not supported by Claude Code sessions" });
+      addNotice({ type: "error", message: backendRef.current === "codex" ? translate("chat.codexShellUnsupported") : "Shell commands are not supported by Claude Code sessions" });
       restoreSubmission(message, images, composerDraftKey);
       return;
     }
@@ -2506,6 +2684,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       // goes back only if the server never got it (settleUnconfirmedSend).
       // Nothing is sent again (#1432).
       if (!definitivelyRejected && sentSessionId) {
+        if (e instanceof AgentCommandError && e.code === "outcome_unknown") addNotice({ type: "error", message: translate("chat.codexOutcomeUnknown") });
         if (landedPromptRunIdRef.current !== promptRunId) {
           unconfirmedSendRef.current = {
             runId: promptRunId,
@@ -2530,6 +2709,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       // A folder that no longer exists never reached the model: the composer's
       // banner names it (translated) instead of the server's English notice.
       if (e instanceof AgentCommandError && e.missingCwd) setPromptMissingCwd(e.missingCwd);
+      else if (e instanceof AgentCommandError && e.code === "outcome_unknown") addNotice({ type: "error", message: translate("chat.codexOutcomeUnknown") });
       else addNotice({ type: "error", message: e instanceof Error ? e.message : String(e) });
       restoreSubmission(message, images, composerDraftKey);
       optimisticUserMessageKeyRef.current = null;
@@ -2546,7 +2726,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       setAgentPhase(null);
       dispatch({ type: "end" });
     }
-  }, [isNew, newSessionCwd, newSessionModel, session, ensureNewSession, ensureEventsConnected, promoteNewSession, waitForPromptSettlement, addNotice, releaseUnconfirmedSend, cancelEventStreamGrace, closeEvents, composerDraftKey, dispatch, reconcileAgentState, restoreSubmission, editEntryId, setEdit, backends.claude, runtimeRequiresProjectTrust]);
+  }, [isNew, newSessionCwd, newSessionModel, session, ensureNewSession, ensureEventsConnected, promoteNewSession, waitForPromptSettlement, addNotice, releaseUnconfirmedSend, cancelEventStreamGrace, closeEvents, composerDraftKey, dispatch, reconcileAgentState, restoreSubmission, editEntryId, setEdit, backends.claude, runtimeRequiresProjectTrust, translate]);
   handleSendRef.current = handleSend;
 
   const executeBash = useCallback(async (command: string, excludeFromContext: boolean) => {
@@ -2659,7 +2839,47 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     }
   }, [capabilities.treeBranch, isCompacting, loadContext]);
 
+  const handleCodexSettingsChange = useCallback(async (selection: CodexSelection) => {
+    if (backendRef.current !== "codex" || modelSwitchPendingRef.current) return;
+    const model = codexModelChoices.find(row => row.model === selection.model);
+    if (modelError || !model?.efforts.some(row => row.value === selection.effort)) return;
+    const sid = sessionIdRef.current;
+    if (!sid && isNew && !ensuringNewSessionRef.current) {
+      codexDraftRef.current = selection;
+      setCodexDraft(selection);
+      return;
+    }
+    if (!sid || agentRunningRef.current) return;
+    modelSwitchPendingRef.current = true;
+    setModelSwitching(true);
+    try {
+      const result = await sendAgentCommand<CodexEffectiveSettings>(sid, { type: "set_settings", ...selection });
+      if (!sessionHookMountedRef.current || sessionIdRef.current !== sid || backendRef.current !== "codex") return;
+      const settings = parseCodexSettings(result);
+      if (!settings) throw new Error("Codex settings were not confirmed");
+      codexSettingsRef.current = settings;
+      setCodexSettings(settings);
+    } catch (e) {
+      if (sessionHookMountedRef.current && sessionIdRef.current === sid) {
+        addNotice({ type: "error", message: e instanceof AgentCommandError && e.code === "outcome_unknown" ? translate("chat.codexSettingsUnknown") : `Failed to change Codex settings: ${e instanceof Error ? e.message : String(e)}` });
+        const state = await sendAgentCommand<AgentStateResponse>(sid, { type: "get_state" }).catch(() => null);
+        if (state && sessionHookMountedRef.current && sessionIdRef.current === sid) syncLiveModel(state);
+      }
+    } finally {
+      modelSwitchPendingRef.current = false;
+      if (sessionHookMountedRef.current && sessionIdRef.current === sid) setModelSwitching(false);
+    }
+  }, [addNotice, codexModelChoices, isNew, modelError, syncLiveModel, translate]);
+
   const handleModelChange = useCallback(async (provider: string, modelId: string) => {
+    if (backendRef.current !== backend) return;
+    if (backendRef.current === "codex") {
+      if (provider !== "codex") return;
+      const model = codexModelChoices.find(row => row.model === modelId);
+      const effort = sessionIdRef.current ? codexSettingsRef.current?.effort ?? null : codexDraftRef.current?.effort ?? null;
+      if (model) await handleCodexSettingsChange(codexSelectionForModel(model, effort));
+      return;
+    }
     if (backendRef.current === "claude") {
       const target = { provider: "claude", modelId };
       if (isNew) {
@@ -2762,7 +2982,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       modelSwitchPendingRef.current = false;
       setModelSwitching(false);
     }
-  }, [addNotice, currentModelOverride, isNew, loadSession, setNewSessionModel, syncLiveModel]);
+  }, [addNotice, backend, codexModelChoices, currentModelOverride, handleCodexSettingsChange, isNew, loadSession, setNewSessionModel, syncLiveModel]);
 
   /**
    * Manual compaction (the Compact button and `/compact`). Never awaited by a
@@ -2779,6 +2999,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     }
     const sid = sessionIdRef.current;
     if (!sid || isCompacting) return true;
+    const native = backendRef.current === "codex";
+    const isCurrent = () => !native || sessionIdRef.current === sid;
     setIsCompacting(true);
     setCompactError(null);
     setCompactResult(null);
@@ -2788,15 +3010,17 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         requestId: createRequestId(),
         ...(customInstructions ? { customInstructions } : {}),
       });
+      if (!isCurrent()) return true;
       setCompactResult(readCompactResult(result, "manual"));
       if (await loadSession(sid, true)) promoteNewSession();
       return true;
     } catch (e) {
+      if (!isCurrent()) return false;
       setCompactError(e instanceof Error ? e.message : String(e));
       setCompactResult(null);
       return false;
     } finally {
-      setIsCompacting(false);
+      if (isCurrent()) setIsCompacting(false);
     }
   }, [addNotice, capabilities.compact, isCompacting, loadSession, promoteNewSession]);
 
@@ -2804,6 +3028,45 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const dismissCompactError = useCallback(() => setCompactError(null), []);
 
   const loadModels = useCallback(async (signal?: AbortSignal) => {
+    const generation = ++modelsGenerationRef.current;
+    const stillCurrent = () => !signal?.aborted && generation === modelsGenerationRef.current && backendRef.current === backend;
+    if (backend === "codex") {
+      const cwd = newSessionCwd ?? session?.cwd ?? "";
+      const sid = sessionIdRef.current;
+      setModelScopeWarnings([]);
+      setIsModelScopeActive(false);
+      setAllModelList(null);
+      allModelsLoadRef.current = null;
+      try {
+        const response = await fetch(`/api/models?backend=codex&cwd=${encodeURIComponent(cwd)}${sid ? `&sessionId=${encodeURIComponent(sid)}` : ""}`, signal ? { signal } : undefined);
+        const body: unknown = await response.json();
+        if (!response.ok) throw new Error(body && typeof body === "object" && "error" in body && typeof body.error === "string" ? body.error : "Codex catalogue is unavailable");
+        const rows = parseCodexModels(body && typeof body === "object" && "models" in body ? body.models : null);
+        if (!stillCurrent()) return;
+        setCodexModelChoices(rows);
+        setModelList(rows.map(row => ({ id: row.model, name: row.label, provider: "codex", providerName: "Codex" })));
+        setModelNames(Object.fromEntries(rows.map(row => [`codex:${row.model}`, row.label])));
+        setModelError(null);
+        setModelsMissingCwd(null);
+        setNewSessionDefaultModel(null);
+        setNewSessionDefaultThinkingLevel(null);
+        setSavedDefaultThinkingLevel(null);
+        if (isNew && !sid && codexDraftRef.current) {
+          const picked = codexDraftRef.current;
+          const model = rows.find(row => row.model === picked.model);
+          const selection = model ? codexSelectionForModel(model, picked.effort) : null;
+          codexDraftRef.current = selection;
+          setCodexDraft(selection);
+        }
+      } catch (e) {
+        if (!stillCurrent()) return;
+        setCodexModelChoices([]);
+        setModelList([]);
+        setModelError(e instanceof Error ? e.message : String(e));
+        throw e;
+      }
+      return;
+    }
     if (backend === "claude") {
       setModelError(null);
       setModelsMissingCwd(null);
@@ -2859,7 +3122,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         }
       }
       signal?.throwIfAborted();
-      const modelList = rows.map(({ supportedEffortLevels: _levels, ...model }) => model);
+      if (!stillCurrent()) return;
+      const modelList = rows.map(({ id, name, provider, providerName }) => ({ id, name, provider, providerName }));
       setModelList(modelList);
       setModelNames(Object.fromEntries(modelList.map((model) => ["claude:" + model.id, model.name])));
       setModelThinkingLevels(Object.fromEntries(rows.map((model) => ["claude:" + model.id, model.supportedEffortLevels])));
@@ -2906,13 +3170,14 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       d = await res.json() as ModelsResponse;
       signal?.throwIfAborted();
     } catch (e) {
-      if (!signal?.aborted && !(e instanceof DOMException && e.name === "AbortError")) {
+      if (stillCurrent() && !(e instanceof DOMException && e.name === "AbortError")) {
         // A moved or deleted project folder is not a model problem (#1422).
         setModelsMissingCwd(cwdGone);
         setModelError(cwdGone ? null : e instanceof Error ? e.message : String(e));
       }
       throw e;
     }
+    if (!stillCurrent()) return;
     setModelsMissingCwd(null);
     setModelNames(d.models);
     setModelError(d.modelError ?? null);
@@ -2987,7 +3252,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   // pi's /model "all" scope: names and reasoning levels of models outside
   // `enabledModels` join the maps, so a picked unscoped model shows them too.
   const loadAllModels = useCallback(() => {
-    if (allModelsLoadRef.current) return;
+    if (backendRef.current !== "pi" || allModelsLoadRef.current) return;
     const load = {};
     allModelsLoadRef.current = load;
     const modelCwd = newSessionCwd ?? session?.cwd ?? "";
@@ -3100,6 +3365,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       }
       return result;
     };
+    if (backendRef.current === "codex" && commandName === "auto-compact") return complete({ handled: true, error: "Native auto-compaction settings are not supported here" });
     if ((commandName === "compact" || commandName === "auto-compact") && !capabilities.compact) {
       return complete({ handled: true, error: "Context compaction is not supported by this backend" });
     }
@@ -3114,6 +3380,12 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     }
     if (commandName === "reload" && backendRef.current !== "pi") {
       return complete({ handled: true, error: "Pi resource reload is not available in Claude Code sessions" });
+    }
+    if (backendRef.current === "codex" && commandName === "mcp") {
+      if (args) return complete({ handled: true, error: "Codex MCP is read only here. Manage configuration and sign-in in Codex." });
+      if (!onOpenSettings) return complete({ handled: true, error: "Native MCP inventory is unavailable" });
+      onOpenSettings("mcp");
+      return complete({ handled: true, action: "openSettings" });
     }
     const sid = sessionIdRef.current ?? await ensureNewSession();
 
@@ -3213,6 +3485,14 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
           if (agentRunningRef.current || bashRunningRef.current) {
             return complete({ handled: true, error: "Cannot clone while the session is running" });
           }
+          if (backendRef.current === "codex") {
+            if (args) return complete({ handled: true, error: "Native fork supports no custom options" });
+            const response = await fetch(`/api/sessions/${encodeURIComponent(sid)}/fork`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+            const result: { sessionId?: string; error?: string } = await response.json();
+            if (!response.ok || !result.sessionId) return complete({ handled: true, error: result.error ?? "Native fork outcome is unknown" });
+            onSessionForked?.(result.sessionId);
+            return complete({ handled: true, message: "Forked native thread" });
+          }
           const result = await sendAgentCommand<{ cancelled?: boolean; newSessionId?: string }>(sid, {
             type: "clone",
             leafId: activeLeafId,
@@ -3277,10 +3557,11 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         setPromptMissingCwd(e.missingCwd);
         return;
       }
-      if (isPromptRejectedError(e)) addNotice({ type: "error", message: e.message });
+      if (e instanceof AgentCommandError && e.code === "outcome_unknown") addNotice({ type: "error", message: translate("chat.codexOutcomeUnknown") });
+      else if (isPromptRejectedError(e)) addNotice({ type: "error", message: e.message });
       else addUnconfirmedSendNotice();
     }
-  }, [addNotice, addUnconfirmedSendNotice, composerDraftKey, editEntryId, restoreSubmission]);
+  }, [addNotice, addUnconfirmedSendNotice, composerDraftKey, editEntryId, restoreSubmission, translate]);
 
   const handleSteer = useCallback(async (message: string, images?: AttachedImage[]) => {
     if (capabilities.steer) await sendStreamingPrompt(message, "steer", images);
@@ -3326,6 +3607,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   }, [addNotice, restoreRecalledPrompts]);
 
   const handleThinkingLevelChange = useCallback(async (level: ThinkingLevelOption) => {
+    if (backendRef.current === "codex") return;
     if (level === "auto") {
       thinkingLevelOverrideRef.current = null;
       setNewSessionThinkingLevel(null);
@@ -3880,32 +4162,77 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   }, [composerDraftKey, pendingClaudeTrustSubmission, restoreSubmission]);
 
   const thinkingLevel: ThinkingLevelOption = displayThinkingLevel ?? "auto";
+  const handleReasoningChange = useCallback((choice: ReasoningChoice) => {
+    if (choice.backend !== backendRef.current) return;
+    if (choice.backend === "codex") {
+      const model = sessionIdRef.current ? codexSettingsRef.current?.model : codexDraftRef.current?.model;
+      if (choice.model === model) void handleCodexSettingsChange({ model: choice.model, effort: choice.effort });
+    } else if (choice.backend === "claude") {
+      void handleThinkingLevelChange(choice.effort ?? "auto");
+    } else void handleThinkingLevelChange(choice.level);
+  }, [handleCodexSettingsChange, handleThinkingLevelChange]);
+  const reasoningControl = useMemo<ReasoningControl | null>(() => {
+    let control: ReasoningControl | null = null;
+    if (capabilities.effort) {
+      const modelKey = displayModel ? `${displayModel.provider}:${displayModel.modelId}` : null;
+      if (backend === "codex") {
+        const selection = isNew && !sessionIdRef.current ? codexDraft : codexSettings;
+        const model = codexModelChoices.find(row => row.model === selection?.model);
+        const rows: ReasoningRow[] = model ? model.efforts.map(row => ({ key: row.value,
+          choice: { backend: "codex", model: model.model, effort: row.value }, label: row.value,
+          description: `${row.description}${row.value === model.defaultEffort ? ` · ${translate("chat.nativeReasoningDefault")}` : ""}`,
+          selected: selection?.effort === row.value,
+        })) : [];
+        control = { label: selection?.effort ?? translate(selection ? "chat.nativeReasoningUnreported" : "chat.nativeReasoningUnresolved"), rows,
+          disabled: Boolean(modelError) || !model || modelSwitching || agentRunning,
+          busy: modelSwitching, onChange: handleReasoningChange };
+      } else {
+        const allowed = modelKey ? modelThinkingLevels[modelKey] : null;
+        const mapping = modelKey ? modelThinkingLevelMaps[modelKey] : null;
+        const levels: readonly ThinkingLevelOption[] = backend === "claude" ? ["auto", ...CLAUDE_EFFORT_LEVELS] : ["auto", "off", "minimal", "low", "medium", "high", "xhigh", "max"];
+        const rows: ReasoningRow[] = levels.filter(level => level === "auto" || !allowed || allowed.includes(level)).flatMap(level => {
+          const choice: ReasoningChoice | null = backend === "claude" ? (level === "auto" ? { backend: "claude", effort: null } : isClaudeEffort(level) ? { backend: "claude", effort: level } : null) : { backend: "pi", level };
+          if (!choice) return [];
+          const label = level === "auto" ? level : mapping?.[level] ?? level;
+          const isAuto = isNew ? newSessionThinkingLevel === null : backend === "claude" && displayThinkingLevel === null;
+          const descKeys = { auto: "chat.thinkingUseDefault", off: "chat.thinkingOff", minimal: "chat.thinkingMinimal", low: "chat.thinkingLow", medium: "chat.thinkingMedium", high: "chat.thinkingHigh", xhigh: "chat.thinkingXhigh", max: "chat.thinkingMax" };
+          return [{ key: level, choice, label, ...(label !== level ? { originalLabel: level } : {}),
+            description: translate(backend === "claude" && level === "auto" ? "chat.claudeReasoningDefault" : descKeys[level]), selected: level === "auto" ? isAuto : !isAuto && thinkingLevel === level,
+            ...(backend === "pi" && level !== "auto" ? { star: { isDefault: savedDefaultThinkingLevel === level,
+              saveLabel: translate("chat.saveDefaultThinking"), defaultLabel: translate("chat.defaultThinking"), onSave: () => { void handleSetDefaultThinkingLevel(level); } } } : {}),
+          }];
+        });
+        if (allowed?.length !== 0) control = { label: (thinkingLevel === "auto" ? "auto" : mapping?.[thinkingLevel]) ?? thinkingLevel,
+          rows, disabled: false, busy: false, onChange: handleReasoningChange };
+      }
+    }
+    return control;
+  }, [agentRunning, backend, capabilities.effort, codexDraft, codexModelChoices, codexSettings, displayModel, displayThinkingLevel, handleReasoningChange, handleSetDefaultThinkingLevel, isNew, modelError, modelSwitching, modelThinkingLevelMaps, modelThinkingLevels, newSessionThinkingLevel, savedDefaultThinkingLevel, thinkingLevel, translate]);
   // The head of each queue is on screen; the rest wait behind it.
   const extensionDialog = extensionDialogs[0] ?? null;
   const waitingExtensionDialogCount = Math.max(0, extensionDialogs.length - 1);
   const extensionCustomUi = extensionCustomUis[0] ?? null;
   const waitingExtensionCustomUiCount = Math.max(0, extensionCustomUis.length - 1);
   const messageKeys = useMemo(
-    () => messageRenderKeys(entryIds, messages.length, messageKeyAliases),
-    [entryIds, messages.length, messageKeyAliases],
+    () => messageRenderKeys(entryIds, messages.length, messageKeyAliases, { messages, keys: liveMessageKeysRef.current }),
+    [entryIds, messages, messageKeyAliases],
   );
+  const messageItemIds = useMemo(() => messages.map((message, index) => entryIds[index] ?? liveMessageIdsRef.current.get(message) ?? null), [entryIds, messages]);
 
   return {
     // State
-    data, loading, error, activeLeafId, messages, activeToolResults, entryIds, messageKeys, historyCursor, hasEarlierMessages, earlierTurnCount, streamingStore,
-    backend, backends, backendsLoading, backendsError, retryBackendDiscovery, capabilities, handleBackendChange, handleSessionHandoff, handoffSwitching,
+    data, loading, error, activeLeafId, messages, activeToolResults, entryIds, messageKeys, messageItemIds, historyCursor, hasEarlierMessages, earlierTurnCount, streamingStore,
+    backend, backends, backendsLoading, backendsError, retryBackendDiscovery, capabilities, handleBackendChange, handleSessionHandoff, handoffSwitching, handoffTargetBackend,
     effectiveNativeModel: effectiveNativeModel ?? data?.effectiveModel ?? backends.claude.claude?.model ?? null,
     agentInteraction: agentInteractions[0] ?? null, waitingAgentInteractionCount: Math.max(0, agentInteractions.length - 1), respondToAgentInteraction,
     pendingClaudeTrustSubmission, confirmClaudeProjectTrust, cancelClaudeProjectTrust,
-    agentRunning, modelNames, modelList, modelError, missingCwd, modelScopeWarnings, isModelScopeActive, allModelList, modelThinkingLevels, modelThinkingLevelMaps, newSessionModel, toolPreset, thinkingLevel,
+    agentRunning, modelNames, modelList, modelError, missingCwd, modelScopeWarnings, isModelScopeActive, allModelList, newSessionModel, toolPreset, reasoningControl,
     retryInfo, contextUsage, systemPrompt, forkingEntryId,
     isCompacting, compactError, compactResult, currentModel, displayModel, modelSwitching, sessionStats, autoCompactionEnabled,
     slashCommands, slashCommandsLoading, queuedMessages,
     notices: noticeState.visible, extensionDialog, waitingExtensionDialogCount, extensionCustomUi, waitingExtensionCustomUiCount, extensionStatuses, extensionWidgets, respondToExtensionUi, sendExtensionCustomInput,
-    isAutoModelSelection: isNew && newSessionModel === null,
-    isAutoThinkingSelection: isNew && newSessionThinkingLevel === null,
+    isAutoModelSelection: isNew && (backend === "codex" ? codexDraft === null : newSessionModel === null),
     defaultModel: newSessionDefaultModel,
-    savedDefaultThinkingLevel,
     agentPhase,
     isNew,
     editEntryId,
@@ -3925,7 +4252,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     cancelEdit: editEntryId ? cancelEdit : undefined,
     addNotice,
     setNoticePaused: setPausedNoticeId,
-    handleToolPresetChange, handleThinkingLevelChange, handleSetDefaultModel, handleSetDefaultThinkingLevel, loadTools, loadSlashCommands, loadModelsForPicker, loadAllModels, setActiveLeafId, setData, setMessages, loadContext,
+    handleToolPresetChange, handleSetDefaultModel, loadTools, loadSlashCommands, loadModelsForPicker, loadAllModels, setActiveLeafId, setData, setMessages, loadContext,
     scrollToBottom, scrollUserMsgToTop, scrollToMessage,
     dispatch, setAgentRunning, setForkingEntryId,
     bashRunning, pendingBash,

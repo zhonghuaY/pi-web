@@ -1,9 +1,8 @@
 import { NextResponse } from "next/server";
-import { isClaudeKey, claudeBackend, claudeEnabled } from "@/lib/claude-routes";
-import { forgetSessionUiState } from "@/lib/session-ui-state";
-import { invalidateSessionListCache } from "@/lib/session-reader";
+import { sessions } from "@/lib/backend-service";
+import { sessionRouteRefusal } from "@/lib/session-route-identity";
 import { hasJsonContentType, isApiRequestAllowed } from "@/lib/request-security";
-import { deleteSessions, MAX_SESSION_DELETE_IDS, type SessionDeleteResult } from "@/lib/session-delete";
+import { MAX_SESSION_DELETE_IDS } from "@/lib/session-delete";
 import { SESSION_ID_PATTERN } from "@/lib/session-ui-state-shared";
 
 export const dynamic = "force-dynamic";
@@ -34,30 +33,18 @@ export async function POST(req: Request) {
   if (!Array.isArray(ids) || ids.length === 0) return refusal(400, "ids must be a non-empty array");
   if (ids.length > MAX_SESSION_DELETE_IDS) return refusal(400, `ids may hold at most ${MAX_SESSION_DELETE_IDS} session ids`);
   if (!ids.every((id) => typeof id === "string" && SESSION_ID_PATTERN.test(id))) return refusal(400, "ids must be session ids");
-
-  if (!claudeEnabled() && ids.some(isClaudeKey)) return refusal(409, "Claude is disabled");
+  for (const id of ids as string[]) { const error = sessionRouteRefusal(id); if (error) { error.headers.set("Cache-Control", "no-store"); return error; } }
 
   try {
-    const selected: string[] = ids;
-    const result = await deleteSessions(selected.filter((id) => !isClaudeKey(id)), { keepRunning: true });
-    const claudeIds = selected.filter(isClaudeKey);
-    if (claudeIds.length) {
-      const backend = await claudeBackend();
-      for (const id of new Set(claudeIds)) {
-        try {
-          await backend.deleteClaudeSession(id);
-          result.deleted.push(id);
-        } catch (error) {
-          const status = typeof error === "object" && error !== null && "status" in error ? error.status : null;
-          if (status === 409) result.running.push(id);
-          else if (status === 404) result.missing.push(id);
-          else throw error;
-        }
-      }
-      await forgetSessionUiState(result.deleted.filter(isClaudeKey));
-      invalidateSessionListCache();
+    const result = await sessions.deleteBulk({ ids });
+    if (!result.ok) {
+      if (result.kind === "disabled") return refusal(409, "Claude is disabled");
+      const error = result.kind === "invalid"
+        ? { error: "Invalid session id", reason: result.reason }
+        : { error: "Codex sessions are not available", reason: "backend-unavailable" };
+      return NextResponse.json(error, { status: 400, headers: NO_STORE });
     }
-    return NextResponse.json(result satisfies SessionDeleteResult, { headers: NO_STORE });
+    return NextResponse.json(result.value, { headers: NO_STORE });
   } catch (error) {
     return refusal(500, error instanceof Error ? error.message : String(error));
   }

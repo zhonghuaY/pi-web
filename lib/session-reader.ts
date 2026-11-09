@@ -671,9 +671,13 @@ export function readSessionHeader(filePath: string): SessionHeader | null {
   }
 }
 
-export function getSessionEntries(filePath: string): SessionEntry[] {
-  const entries = openSessionManager(filePath).getEntries();
+// The SDK's extensible message type and our local transcript shape describe the same entries.
+export function toSessionEntries(entries: ReturnType<SessionManager["getEntries"]>): SessionEntry[] {
   return entries as unknown as SessionEntry[];
+}
+
+export function getSessionEntries(filePath: string): SessionEntry[] {
+  return toSessionEntries(openSessionManager(filePath).getEntries());
 }
 
 export function getLatestModelChange(entries: SessionEntry[]): SessionContext["model"] {

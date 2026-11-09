@@ -328,6 +328,12 @@ function isCompactionInProgressError(error: unknown): boolean {
 // Wraps AgentSession with the same interface the rest of the app expects
 // ============================================================================
 
+export class PiHandoffCaptureError extends Error {
+  constructor(readonly reason: "starting" | "busy" | "capturing", message: string) {
+    super(message);
+  }
+}
+
 export class AgentSessionWrapper {
   // A Set, not an array: an SSE stream unsubscribes from inside emit() when it
   // closes on session_shutdown, and splicing an array mid-iteration made the
@@ -347,7 +353,7 @@ export class AgentSessionWrapper {
   // Prompts waiting for the running compaction to finish (ParkedPrompt above).
   private parkedDuringCompaction: ParkedPrompt[] = [];
   private activeMutatingCommands = 0;
-  private sessionReplacement: "fork" | "clone" | null = null;
+  private sessionReplacement: "fork" | "clone" | "handoff" | null = null;
   private agentRunNeedsCompletion = false;
   // Whether the last run ended because it was stopped (pi 1.1's `agent_settled.aborted`), not finished.
   private lastRunAborted = false;
@@ -473,7 +479,7 @@ export class AgentSessionWrapper {
    * prompt that started during the probe cannot be disposed.
    */
   evictIfDiskAhead(): boolean {
-    if (!this.isAlive() || this.isRunning()) return false;
+    if (!this.isAlive() || this.isRunning() || this.sessionReplacement === "handoff") return false;
     const diskLatestId = readLatestSessionEntryId(this.sessionFile);
     if (!diskLatestId || this.inner.sessionManager.getEntry(diskLatestId)) return false;
     if (this.isRunning()) return false;
@@ -1011,6 +1017,10 @@ export class AgentSessionWrapper {
     this.idleDeadlineAt = this.idleLastResetAt + timeoutMs;
     this.idleTimer = setTimeout(() => {
       this.idleDeadlineAt = null;
+      if (this.sessionReplacement === "handoff") {
+        this.resetIdleTimer();
+        return;
+      }
       if (!this.forceShutdownOnIdle && (this.isRunning() || hasActiveSessionLivenessProvider({
         sessionId: this.sessionId,
         sessionFile: this.sessionFile || undefined,
@@ -1070,8 +1080,16 @@ export class AgentSessionWrapper {
     return Promise.race([this.disposed.then(() => true), timedOut]).finally(() => clearTimeout(timer));
   }
 
+  /** Reserve this live owner while the handoff reads its fixed source tip. */
+  async withHandoffSnapshot<T>(operation: () => Promise<T>): Promise<T> {
+    if (!this.isAlive() || this.isRunning() || this.activeMutatingCommands > 0 || this.sessionReplacement) {
+      throw new PiHandoffCaptureError("busy", "Source session is busy");
+    }
+    return this.withSessionReplacement("handoff", operation);
+  }
+
   private async withSessionReplacement<T>(
-    replacement: "fork" | "clone",
+    replacement: "fork" | "clone" | "handoff",
     operation: () => Promise<T>,
   ): Promise<T> {
     if (this.sessionReplacement) throw new Error("Session is already being copied");
@@ -1788,6 +1806,7 @@ export class AgentSessionWrapper {
   }
 
   async shutdown(): Promise<void> {
+    if (this.sessionReplacement === "handoff") throw new PiHandoffCaptureError("capturing", "Source capture is already in progress");
     if (this.shutdownPromise) return this.shutdownPromise;
     if (!this._alive) return;
     // Closing starts before the first await, so a request that arrives while
@@ -2437,6 +2456,7 @@ export class AgentSessionWrapper {
 declare global {
   var __piSessions: Map<string, AgentSessionWrapper> | undefined;
   var __piStartLocks: Map<string, Promise<{ session: AgentSessionWrapper; realSessionId: string }>> | undefined;
+  var __piHandoffCaptures: Set<string> | undefined;
   /** Debug panel: the id a `__new__…`/`__recreate__…` start registered its wrapper under, while its lock is held. */
   var __piStartRegisteredIds: Map<string, string> | undefined;
   var __piStartingSessionCwds: Map<string, number> | undefined;
@@ -2569,6 +2589,26 @@ function getLocks(): Map<string, Promise<{ session: AgentSessionWrapper; realSes
   return globalThis.__piStartLocks;
 }
 
+/**
+ * Reserve a source against Pi Web session starts and live wrapper mutations.
+ * External Pi CLI writers do not share this barrier; callers must check the
+ * source bytes again before committing the captured tip.
+ */
+export async function withPiHandoffSnapshot<T>(sessionId: string, operation: () => Promise<T>): Promise<T> {
+  const captures = globalThis.__piHandoffCaptures ??= new Set();
+  if (captures.has(sessionId)) throw new PiHandoffCaptureError("capturing", "Source capture is already in progress");
+  if (getLocks().has(sessionId)) throw new PiHandoffCaptureError("starting", "Source session is starting");
+  if (hasUnsettledSubagentRun(sessionId)) throw new PiHandoffCaptureError("busy", "Source session is busy");
+  const wrapper = getRegistry().get(sessionId);
+  if (wrapper && !wrapper.isAlive()) throw new PiHandoffCaptureError("busy", "Source session is closing");
+  captures.add(sessionId);
+  try {
+    return wrapper ? await wrapper.withHandoffSnapshot(operation) : await operation();
+  } finally {
+    captures.delete(sessionId);
+  }
+}
+
 // Bookkeeping for getRpcStartingSessionIds() only: a failure here must never fail a start.
 function recordStartRegisteredId(startKey: string, realSessionId: string): void {
   try {
@@ -2662,6 +2702,7 @@ export function getRpcSession(sessionId: string): AgentSessionWrapper | undefine
  */
 export async function renameRpcSession(sessionId: string, name: string, writeToDisk: () => boolean): Promise<boolean> {
   for (;;) {
+    if (globalThis.__piHandoffCaptures?.has(sessionId)) throw new PiHandoffCaptureError("capturing", "Source capture is already in progress");
     const wrapper = getRegistry().get(sessionId);
     if (wrapper?.isAlive()) {
       wrapper.inner.setSessionName(name);
@@ -2691,6 +2732,7 @@ export async function setRpcSessionTools(
   sessionFile: string | undefined,
   requestedToolNames: unknown,
 ): Promise<SetRpcSessionToolsResult> {
+  if (globalThis.__piHandoffCaptures?.has(sessionId)) throw new PiHandoffCaptureError("capturing", "Source capture is already in progress");
   const toolNames = requestedToolNames === undefined
     ? undefined
     : validateSessionToolSelection(requestedToolNames);
@@ -3050,6 +3092,9 @@ export async function startRpcSession(
   cwd: string | undefined,
   options: RpcSessionStartOptions = {},
 ): Promise<{ session: AgentSessionWrapper; realSessionId: string }> {
+  if (globalThis.__piHandoffCaptures?.has(sessionId)) {
+    throw new PiHandoffCaptureError("capturing", "Source capture is already in progress");
+  }
   const { initialModel, allowInitialModelFallback, thinkingLevel } = options;
   const requestedToolNames = options.toolNames === undefined
     ? undefined

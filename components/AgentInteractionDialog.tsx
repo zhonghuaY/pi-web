@@ -29,9 +29,11 @@ export function AgentInteractionDialog({ request, waitingCount, onRespond }: {
         {request.kind === "permission" ? (
           <>
             {request.input !== undefined && <pre className="my-3 max-h-48 overflow-auto whitespace-pre-wrap break-words rounded-lg bg-bg px-3 py-2 text-xs text-text-muted">{typeof request.input === "string" ? request.input : JSON.stringify(request.input, null, 2)}</pre>}
+            {request.approvalOptions && !request.approvalOptions.accept && <p className="mt-3 text-sm text-text-muted">{t("claudeInteraction.unsupportedApproval")}</p>}
             <div className="mt-4 flex justify-end gap-2">
-              <button type="button" disabled={request.submitting} onClick={() => onRespond(request.id, { approved: false })} className="rounded-lg border border-border px-3 py-2 text-sm text-text-muted disabled:opacity-50">{t("claudeInteraction.deny")}</button>
-              <button type="button" disabled={request.submitting} onClick={() => onRespond(request.id, { approved: true })} className="rounded-lg bg-accent px-3 py-2 text-sm font-medium text-white disabled:opacity-50">{t("claudeInteraction.allow")}</button>
+              {request.approvalOptions && <button type="button" disabled={request.submitting} onClick={() => onRespond(request.id, { cancelled: true })} className="rounded-lg border border-border px-3 py-2 text-sm text-text-muted disabled:opacity-50">{t("i18n.cancel")}</button>}
+              {request.approvalOptions?.decline !== false && <button type="button" disabled={request.submitting} onClick={() => onRespond(request.id, { approved: false })} className="rounded-lg border border-border px-3 py-2 text-sm text-text-muted disabled:opacity-50">{t("claudeInteraction.deny")}</button>}
+              {request.approvalOptions?.accept !== false && <button type="button" disabled={request.submitting} onClick={() => onRespond(request.id, { approved: true })} className="rounded-lg bg-accent px-3 py-2 text-sm font-medium text-white disabled:opacity-50">{t("claudeInteraction.allow")}</button>}
             </div>
           </>
         ) : (
@@ -48,7 +50,7 @@ export function AgentInteractionDialog({ request, waitingCount, onRespond }: {
                       <span><span className="block text-sm text-text">{option.label}</span>{option.description && <span className="block text-xs text-text-muted">{option.description}</span>}</span>
                     </label>;
                   })}
-                  <input value={written[question.question] ?? ""} onChange={(event) => setWritten((current) => ({ ...current, [question.question]: event.target.value }))} placeholder={t("claudeInteraction.otherAnswer")} className="w-full rounded-lg border border-border bg-bg px-3 py-2 text-sm text-text outline-none focus:border-accent" />
+                  <input type={question.isSecret ? "password" : "text"} value={written[question.question] ?? ""} onChange={(event) => setWritten((current) => ({ ...current, [question.question]: event.target.value }))} placeholder={t("claudeInteraction.otherAnswer")} className="w-full rounded-lg border border-border bg-bg px-3 py-2 text-sm text-text outline-none focus:border-accent" />
                 </fieldset>
               ))}
             </div>

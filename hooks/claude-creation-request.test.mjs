@@ -23,6 +23,7 @@ test("ambiguous dormant creation retries retain the composer's creation requestI
   const scope = {
     sessionIdRef: { current: null }, isNew: true, newSessionCwd: "/project", ensuringNewSessionRef: { current: null },
     backendRef: { current: "claude" }, newSessionModelOverrideRef: { current: null }, thinkingLevelOverrideRef: { current: null },
+    codexDraftRef: { current: null },
     claudeProjectTrustConfirmedRef: { current: false },
     setPendingModel() {}, getToolNamesForPreset() { throw new Error("Claude must not resolve Pi tools"); },
     toolPreset: "configured", sessionToolsPinnedRef: { current: false },

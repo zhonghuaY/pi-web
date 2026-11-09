@@ -1,192 +1,40 @@
+import { sessionRouteRefusal } from "@/lib/session-route-identity";
 import { NextResponse } from "next/server";
-import { isClaudeKey, claudeSession, claudeRename, claudeDelete } from "@/lib/claude-routes";
-import { existsSync, statSync } from "fs";
-import {
-  attachSessionProjectInfo,
-  openSessionManager,
-  resolveSessionPath,
-  resolveSessionIdByPath,
-  invalidateSessionListCache,
-  invalidateSessionManagerCache,
-  buildSessionContext,
-} from "@/lib/session-reader";
-import { getRpcSession, renameRpcSession, subagentDisplayStatus } from "@/lib/rpc-manager";
-import { projectTreeForResponse, toSummaryTree } from "@/lib/project-tree";
-import { computeSessionTotalActiveMs } from "@/lib/session-timing";
-import { computeSessionStats } from "@/lib/session-stats";
+import { sessions, type SessionHistoryFailure } from "@/lib/backend-service";
 import { startServerPerf } from "@/lib/perf";
-import { computeSessionRevision } from "@/lib/session-revision";
-import type { SessionEntry } from "@/lib/types";
-import { readSubagentRun, readSubagentSessionResources } from "@/lib/subagents";
-import { readSideRelation, sideOwnEntries } from "@/lib/side-session";
-import { readSessionToolSelection } from "@/lib/session-tool-selection";
 import { jsonResponse } from "@/lib/json-response";
-import { deleteSessions } from "@/lib/session-delete";
-import { attachTranscriptNotices, readSessionTranscriptNotices } from "@/lib/transcript-notices-server";
-import { sessionHandoffRelation, sessionHandoffTitle } from "@/lib/session-handoff";
+import { cwdMissingBody, missingCwdFromBody } from "@/lib/missing-cwd";
 
-export async function GET(
-  req: Request,
-  { params }: { params: Promise<{ id: string }> }
-) {
-  const { id } = await params;
-  if (isClaudeKey(id)) return claudeSession(req, id);
-  const perf = startServerPerf("GET /api/sessions/[id]");
-  try {
-    perf?.span("resolve");
-    const rpc = getRpcSession(id);
-    const searchParams = new URL(req.url).searchParams;
-    const force = searchParams.get("force") === "1";
-
-    // A live wrapper only reflects the appends pi-web itself made. When another
-    // pi process (the TUI) writes the same session file, the in-memory index
-    // stays stale. Only probe on ?force=1 (session mount / page refresh): two
-    // processes writing one JSONL is unsupported, so post-turn reads must not
-    // scan disk. Eviction is idle-only; mid-run the wrapper owns the write path.
-    let liveWrapper = rpc?.isAlive() ? rpc : undefined;
-    let wrapperRebuilt = false;
-    if (force && liveWrapper?.evictIfDiskAhead()) {
-      wrapperRebuilt = true;
-      liveWrapper = undefined;
-    }
-    const liveRpc = liveWrapper;
-    const resolvedPath = liveRpc ? null : await resolveSessionPath(id);
-    if (!liveRpc && !resolvedPath) {
-      return NextResponse.json({ error: "Session not found" }, { status: 404 });
-    }
-
-    const sm = liveRpc?.inner.sessionManager ?? openSessionManager(resolvedPath!);
-    perf?.span("open");
-    const filePath = liveRpc?.sessionFile || sm.getSessionFile() || resolvedPath || "";
-    const entries = sm.getEntries();
-    const leafId = sm.getLeafId();
-    const summaryTree = searchParams.get("tree") === "summary";
-    const tree = summaryTree
-      ? toSummaryTree(projectTreeForResponse(sm.getTree()))
-      : projectTreeForResponse(sm.getTree());
-    perf?.span("tree");
-    const deferThinking = searchParams.has("deferThinking");
-    const deferToolResultImages = searchParams.has("deferMedia");
-    const rawTail = Number(searchParams.get("tail"));
-    const tail = Number.isFinite(rawTail) && rawTail > 0 ? Math.min(rawTail, 1000) : 50;
-    // pi's showCacheMissNotices (#1265): cache, cost and provider notices on the messages they follow.
-    const transcriptNotices = readSessionTranscriptNotices({
-      entries: entries as unknown as SessionEntry[],
-      cwd: sm.getHeader()?.cwd ?? "",
-      leafId: leafId,
-      models: liveRpc?.inner.modelRuntime,
-    });
-    const context = attachTranscriptNotices(buildSessionContext(entries as never, leafId, {
-      deferThinking,
-      deferToolResultImages,
-      tail,
-      sessionId: id, // local: lazy URLs for historical tool-result images
-    }), transcriptNotices);
-    perf?.span("context");
-    const ownEntries = sideOwnEntries(entries) as typeof entries;
-    const totalActiveMs = computeSessionTotalActiveMs(ownEntries);
-    // Cumulative usage over ALL entries, including history compacted away —
-    // the same aggregation the SDK's getSessionStats() uses. Lets the client
-    // keep monotonic token/cost counters across compaction and page reloads.
-    const stats = computeSessionStats(ownEntries as unknown as SessionEntry[]);
-    perf?.span("stats");
-    // Opaque freshness token for the session view cache. Derived from the
-    // disk fingerprint and the actual read source; null tells the client the
-    // snapshot is unstable and must not be cached as fresh.
-    const latestEntry = entries[entries.length - 1] as { id?: string } | undefined;
-    const snapshotRevision = computeSessionRevision({
-      filePath,
-      // The notices switch changes the messages without touching the file.
-      sourceId: `${liveRpc ? `runtime:${String(liveRpc.inner.sessionId)}` : "disk"}${transcriptNotices ? "+notices" : ""}`,
-      entryCount: entries.length,
-      latestEntryId: typeof latestEntry?.id === "string" ? latestEntry.id : null,
-      leafId: leafId ?? null,
-    });
-    const sessionName = sm.getSessionName();
-    const firstUserEntry = entries.find((entry) => entry.type === "message" && entry.message.role === "user");
-    const firstUserMessage = firstUserEntry?.type === "message" ? firstUserEntry.message : undefined;
-
-    const header = sm.getHeader();
-    let modified = header?.timestamp ?? new Date().toISOString();
-    try { modified = statSync(filePath).mtime.toISOString(); } catch { /* use header timestamp */ }
-    const parentSessionId = header?.parentSession
-      ? await resolveSessionIdByPath(header.parentSession)
-      : undefined;
-    const subagent = header
-      ? readSubagentRun(entries as never, header.id, filePath)
-      : null;
-    const side = !subagent && header ? readSideRelation(entries as never) : null;
-    const toolNames = readSubagentSessionResources(entries as never)?.tools
-      ?? readSessionToolSelection(entries as never);
-    const firstUserText = firstUserMessage
-      ? (() => {
-          const content = (firstUserMessage as { content: unknown }).content;
-          return typeof content === "string"
-            ? content
-            : Array.isArray(content)
-              ? (content.find((block: { type: string }) => block.type === "text") as { text: string } | undefined)?.text ?? ""
-              : "";
-        })()
-      : "";
-    const handoff = sessionHandoffRelation(firstUserText);
-    const info = header ? (await attachSessionProjectInfo([{
-      path: filePath,
-      id: header.id,
-      cwd: header.cwd ?? "",
-      name: sessionName,
-      created: header.timestamp,
-      modified,
-      messageCount: stats.totalMessages,
-      firstMessage: (sessionHandoffTitle(firstUserText, "pi") ?? firstUserText) || "(no messages)",
-      parentSessionId,
-      ...(subagent
-        ? { relation: { kind: "subagent" as const, parentSessionId: subagent.parentSessionId, profile: subagent.profile, description: subagent.description, status: subagentDisplayStatus(header.id, subagent.status) } }
-        : side
-          ? { relation: { kind: "side" as const, ...side } }
-          : header.parentSession
-            ? { relation: { kind: "fork" as const, ...(parentSessionId ? { originSessionId: parentSessionId } : {}) } }
-            : handoff
-              ? { relation: handoff }
-              : {}),
-      transient: !filePath || !existsSync(filePath),
-    }]))[0] : null;
-
-    return perf?.attach(jsonResponse(
-      req,
-      {
-        sessionId: id,
-        filePath,
-        info,
-        leafId,
-        tree,
-        ...(summaryTree ? { treeFormat: "summary" as const } : {}),
-        snapshotRevision,
-        context,
-        stats,
-        totalActiveMs,
-        ...(toolNames !== undefined ? { toolNames } : {}),
-        ...(wrapperRebuilt ? { wrapperRebuilt: true } : {}),
-      },
-    )) ?? jsonResponse(
-      req,
-      {
-        sessionId: id,
-        filePath,
-        info,
-        leafId,
-        tree,
-        ...(summaryTree ? { treeFormat: "summary" as const } : {}),
-        snapshotRevision,
-        context,
-        stats,
-        totalActiveMs,
-        ...(toolNames !== undefined ? { toolNames } : {}),
-        ...(wrapperRebuilt ? { wrapperRebuilt: true } : {}),
-      },
-    );
-  } catch (error) {
-    return NextResponse.json({ error: String(error) }, { status: 500 });
+function historyFailure(result: SessionHistoryFailure) {
+  if (result.kind === "invalid") return NextResponse.json({ error: "Invalid session id", reason: result.reason }, { status: 400 });
+  if (result.kind === "unsupported") return NextResponse.json({ error: "Codex sessions are not available", reason: "backend-unavailable" }, { status: 400 });
+  if (result.kind === "not-found") return NextResponse.json({ error: "Session not found" }, { status: 404 });
+  const { backend, error } = result;
+  if (backend === "pi") return NextResponse.json({ error: String(error) }, { status: 500 });
+  if (backend === "codex") {
+    const cwd = missingCwdFromBody(error);
+    if (cwd) return NextResponse.json(cwdMissingBody(cwd), { status: 409 });
+    const kind = typeof error === "object" && error !== null && "kind" in error ? error.kind : undefined;
+    const reason = kind === "unavailable" || kind === "version" || kind === "spawn" ? "backend-unavailable" : kind === "invalid-payload" ? "invalid-payload" : "history-unavailable";
+    return NextResponse.json({ error: "Codex session history is unavailable", reason }, { status: kind === "invalid-payload" ? 502 : 503 });
   }
+  const status = typeof error === "object" && error !== null && "status" in error && typeof error.status === "number" ? error.status : 400;
+  return NextResponse.json({ error: error instanceof Error ? error.message : "Claude operation failed" }, { status });
+}
+
+export async function GET(req: Request, { params }: { params: Promise<{ id: string }> }) {
+  const { id } = await params;
+  const query = new URL(req.url).searchParams;
+  const perf = startServerPerf("GET /api/sessions/[id]");
+  const result = await sessions.read(id, {
+    tail: Number(query.get("tail")), before: query.get("before") ?? undefined,
+    force: query.get("force") === "1", summaryTree: query.get("tree") === "summary",
+    deferThinking: query.has("deferThinking"), deferToolResultImages: query.has("deferMedia"),
+  }, perf);
+  if (!result.ok) return historyFailure(result);
+  if (result.backend !== "pi") return NextResponse.json(result.value, { headers: { "Cache-Control": "no-store" } });
+  const response = jsonResponse(req, result.value);
+  return perf?.attach(response) ?? response;
 }
 
 // PATCH /api/sessions/[id]  body: { name: string }
@@ -195,28 +43,20 @@ export async function PATCH(
   { params }: { params: Promise<{ id: string }> }
 ) {
   const { id } = await params;
+  const invalidSession = sessionRouteRefusal(id);
+  if (invalidSession) return invalidSession;
   try {
     const { name } = await req.json() as { name?: string };
     if (typeof name !== "string") {
       return NextResponse.json({ error: "name is required" }, { status: 400 });
     }
-    if (isClaudeKey(id)) return claudeRename(id, name);
-    const filePath = await resolveSessionPath(id);
-    const trimmed = name.trim();
-    // A session a wrapper holds is renamed in it, never on disk behind its back (#1388).
-    const renamed = await renameRpcSession(id, trimmed, () => {
-      if (!filePath) return false;
-      // No wrapper: appendSessionInfo on a fresh manager, bypassing the cache.
-      const sm = openSessionManager(filePath, { mutable: true });
-      sm.appendSessionInfo(trimmed);
-      invalidateSessionManagerCache(filePath);
-      invalidateSessionListCache();
-      return true;
-    });
-    if (!renamed) {
-      return NextResponse.json({ error: "Session not found" }, { status: 404 });
+    const result = await sessions.rename({ id, name });
+    if (!result.ok) {
+      if (result.kind === "disabled") return NextResponse.json({ error: "Claude is disabled" }, { status: 409 });
+      if (result.kind === "empty-name") return NextResponse.json({ error: "Name is required" }, { status: 400 });
+      return historyFailure(result);
     }
-    return NextResponse.json({ ok: true });
+    return NextResponse.json(result.value);
   } catch (error) {
     return NextResponse.json({ error: String(error) }, { status: 500 });
   }
@@ -228,13 +68,15 @@ export async function DELETE(
   { params }: { params: Promise<{ id: string }> }
 ) {
   const { id } = await params;
+  const invalidSession = sessionRouteRefusal(id);
+  if (invalidSession) return invalidSession;
   try {
-    if (isClaudeKey(id)) return claudeDelete(id);
-    const { missing } = await deleteSessions([id]);
-    if (missing.length > 0) {
-      return NextResponse.json({ error: "Session not found" }, { status: 404 });
+    const result = await sessions.delete({ id });
+    if (!result.ok) {
+      if (result.kind === "claude-error") return NextResponse.json({ error: result.error }, { status: result.status });
+      return historyFailure(result);
     }
-    return NextResponse.json({ ok: true });
+    return NextResponse.json(result.value);
   } catch (error) {
     return NextResponse.json({ error: String(error) }, { status: 500 });
   }

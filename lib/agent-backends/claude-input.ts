@@ -1,3 +1,4 @@
+import { isClaudeEffort } from "@/lib/agent-session-choices";
 import type { EffortLevel, ModelInfo, PermissionMode, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import { isRecord } from "./claude-projection";
 import { isNativeClaudeSessionId, type AgentInteractionQuestion } from "./types";
@@ -18,8 +19,7 @@ export function parseClaudePermissionMode(value: unknown): PermissionMode | unde
 }
 
 export function parseClaudeEffort(value: unknown): EffortLevel | undefined {
-  return value === "low" || value === "medium" || value === "high" || value === "xhigh" || value === "max"
-    ? value : undefined;
+  return isClaudeEffort(value) ? value : undefined;
 }
 
 function supportedMime(value: string): value is SupportedMime {

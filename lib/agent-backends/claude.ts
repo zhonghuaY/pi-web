@@ -310,6 +310,10 @@ export async function readClaudeSession(
   };
 }
 
+export async function readClaudeHandoffTranscript(webId: string, cwd: string): Promise<SessionMessage[]> {
+  return getSessionMessages(nativeClaudeSessionId(webId), { dir: cwd, includeSystemMessages: true });
+}
+
 export async function getClaudeDisplayMessages(webId: string): Promise<AgentMessage[]> {
   const all = await history(webId);
   return all.projected.map((entry) => entry.message);

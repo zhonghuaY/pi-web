@@ -2,7 +2,7 @@
 import { registerAbortHandler } from "@/hooks/useKeyboardShortcuts";
 import { isHiddenRelation, SIDE_BOUNDARY_MESSAGE_TYPE } from "@/lib/session-family";
 import Image from "next/image";
-import { Fragment, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { Fragment, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ComponentProps, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import type { AgentMessage, AssistantContentBlock, AssistantMessage, BashExecutionMessage, BlockingExtensionUiRequest, ExtensionUiRequest, SessionInfo, SessionTreeNode, ToolResultMessage } from "@/lib/types";
 import { normalizeCustomPanelLines, stripAnsi } from "@/lib/ansi";
@@ -20,14 +20,15 @@ import { MarkdownBody } from "./MarkdownBody";
 import { ChatInput, type ChatInputHandle } from "./ChatInput";
 import { ClaudeSubagentHistory } from "./ClaudeSubagentHistory";
 import { AgentInteractionDialog, ClaudeProjectTrustDialog } from "./AgentInteractionDialog";
-import type { AgentBackend, AgentBackends, AgentCapabilities } from "@/lib/agent-backends";
+import { sessionBackend, type AgentBackend, type AgentBackends, type AgentCapabilities } from "@/lib/agent-backends";
+import { isCodexSessionId } from "@/lib/codex-reconcile";
 import { ChatMinimap, useMessageRefs } from "./ChatMinimap";
 import { ExtensionStatusBar } from "./ExtensionStatusBar";
 import { AnsiText } from "./AnsiText";
 import { useI18n } from "@/hooks/useI18n";
 import { phaseLabel } from "@/lib/chat-phase-label";
 import { useAgentSession, type AgentEndInfo, type NewSessionChoices, type NoticeItem } from "@/hooks/useAgentSession";
-import { selectHasStreamingContent, selectIsStreaming, selectStreamingMessage, useStreamingSelector } from "@/hooks/useStreamingSelector";
+import { selectHasStreamingContent, selectIsStreaming, selectStreamingKeys, useStreamingSelector } from "@/hooks/useStreamingSelector";
 import type { StreamingStore } from "@/lib/streaming-message";
 import { useDragDrop } from "@/hooks/useDragDrop";
 import { useIsMobile } from "@/hooks/useIsMobile";
@@ -289,17 +290,15 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
   const [restoreAnchorReady, setRestoreAnchorReady] = useState(false);
 
   const {
-    loading, error, messages, activeToolResults, entryIds, messageKeys, historyCursor, hasEarlierMessages, earlierTurnCount, streamingStore,
-    backend, backends, backendsLoading, backendsError, retryBackendDiscovery, capabilities, handleBackendChange, handleSessionHandoff, handoffSwitching, effectiveNativeModel, agentInteraction, waitingAgentInteractionCount, respondToAgentInteraction, pendingClaudeTrustSubmission, confirmClaudeProjectTrust, cancelClaudeProjectTrust,
-    agentRunning, bashRunning, pendingBash, modelNames, modelList, modelError, missingCwd, modelScopeWarnings, isModelScopeActive, allModelList, modelThinkingLevels, modelThinkingLevelMaps, toolPreset, thinkingLevel,
+    loading, error, messages, activeToolResults, entryIds, messageKeys, messageItemIds, historyCursor, hasEarlierMessages, earlierTurnCount, streamingStore,
+    backend, backends, backendsLoading, backendsError, retryBackendDiscovery, capabilities, handleBackendChange, handleSessionHandoff, handoffSwitching, handoffTargetBackend, effectiveNativeModel, agentInteraction, waitingAgentInteractionCount, respondToAgentInteraction, pendingClaudeTrustSubmission, confirmClaudeProjectTrust, cancelClaudeProjectTrust,
+    agentRunning, bashRunning, pendingBash, modelNames, modelList, modelError, missingCwd, modelScopeWarnings, isModelScopeActive, allModelList, toolPreset, reasoningControl,
     retryInfo, contextUsage, forkingEntryId,
     isCompacting, compactError, compactResult, displayModel: displayModelValue, modelSwitching, sessionStats,
     slashCommands, slashCommandsLoading, queuedMessages,
     notices, extensionDialog, waitingExtensionDialogCount, extensionCustomUi, waitingExtensionCustomUiCount, extensionStatuses, extensionWidgets, respondToExtensionUi, sendExtensionCustomInput, setNoticePaused, addNotice,
     isAutoModelSelection,
-    isAutoThinkingSelection,
     defaultModel,
-    savedDefaultThinkingLevel,
     agentPhase,
     isNew,
     editEntryId,
@@ -311,7 +310,7 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
     dismissCompactError,
     handleRecallQueue,
     handleBuiltinSlashCommand,
-    handleToolPresetChange, handleThinkingLevelChange, handleSetDefaultModel, handleSetDefaultThinkingLevel, loadSlashCommands, loadModelsForPicker, loadAllModels, scrollUserMsgToTop,
+    handleToolPresetChange, handleSetDefaultModel, loadSlashCommands, loadModelsForPicker, loadAllModels, scrollUserMsgToTop,
     loadContext, activeLeafId, scrollToBottom, scrollToMessage,
   } = useAgentSession({
     session, sessionRunning, newSessionCwd, newSessionDraftKey, initialNewSessionChoices, onNewSessionChoicesChange, onBackendScopeChange, onAgentEnd: wrappedOnAgentEnd, onToolEnd, onAttentionNeeded, onSessionCreated, onSessionHandoff, onSessionForked, onSideSession,
@@ -323,7 +322,10 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
   // re-render StreamingReply alone.
   const isStreaming = useStreamingSelector(streamingStore, selectIsStreaming);
   const hasStreamingContent = useStreamingSelector(streamingStore, selectHasStreamingContent);
-  const getStreamingMessage = useCallback(() => streamingStore.getState().streamingMessage, [streamingStore]);
+  const getStreamingMessages = useCallback(() => {
+    const state = streamingStore.getState();
+    return state.order.filter(key => !messageItemIds.includes(key)).map(key => state.streams.get(key)).filter((message): message is AssistantMessage => message !== undefined);
+  }, [messageItemIds, streamingStore]);
   const sessionBusy = agentRunning || bashRunning;
   // While this session's run is under way its chime may come with the phone
   // locked, where a suspended context cannot start again (#1157).
@@ -945,14 +947,6 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
   }, []);
   useLayoutEffect(updatePromptAnchor, [isStreaming, hasStreamingContent, updatePromptAnchor]);
 
-  const availableThinkingLevels = displayModelValue
-    ? (modelThinkingLevels[`${displayModelValue.provider}:${displayModelValue.modelId}`] ?? null)
-    : null;
-
-  const currentThinkingLevelMap = displayModelValue
-    ? (modelThinkingLevelMaps[`${displayModelValue.provider}:${displayModelValue.modelId}`] ?? null)
-    : null;
-
   const chatInputElement = (
     <ChatInput
       ref={chatInputRef}
@@ -976,6 +970,7 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
           : undefined}
       backendHandoff={!isNew}
       backendChanging={handoffSwitching}
+      handoffTargetBackend={handoffTargetBackend}
       effectiveNativeModel={effectiveNativeModel}
       shellCommandsEnabled={backend === "pi"}
       model={displayModelValue}
@@ -989,24 +984,18 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
       onLoadAllModels={backend === "pi" && isModelScopeActive ? loadAllModels : undefined}
       onLoadModels={capabilities.models ? loadModelsForPicker : undefined}
       onModelChange={capabilities.setModel ? handleModelChange : undefined}
-      modelSwitching={modelSwitching}
+      modelSwitching={modelSwitching || (backend === "codex" && agentRunning)}
       defaultModel={defaultModel}
       onSetDefaultModel={backend === "pi" ? handleSetDefaultModel : undefined}
       onCompact={capabilities.compact && (session || isNew) ? handleCompact : undefined}
-      onAbortCompaction={handleAbortCompaction}
+      onAbortCompaction={backend === "codex" ? undefined : handleAbortCompaction}
       isCompacting={isCompacting}
       compactError={compactError}
       onDismissCompactError={dismissCompactError}
       compactResult={compactResult}
       toolPreset={toolPreset}
       onToolPresetChange={capabilities.toolPresets && ((session && !isHiddenRelation(session.relation)) || isNew) ? handleToolPresetChange : undefined}
-      thinkingLevel={thinkingLevel}
-      isAutoThinkingSelection={isAutoThinkingSelection}
-      onThinkingLevelChange={capabilities.effort && availableThinkingLevels?.length !== 0 && (session || isNew) ? handleThinkingLevelChange : undefined}
-      availableThinkingLevels={availableThinkingLevels}
-      thinkingLevelMap={currentThinkingLevelMap}
-      savedDefaultThinkingLevel={savedDefaultThinkingLevel}
-      onSetDefaultThinkingLevel={backend === "pi" && (session || isNew) ? handleSetDefaultThinkingLevel : undefined}
+      reasoning={reasoningControl}
       retryInfo={retryInfo}
       queuedMessages={queuedMessages}
       inputHistory={inputHistory}
@@ -1161,8 +1150,6 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
                 const isVisible = isMessageGroupAnchor(msg) || msg.role === "assistant";
                 const currentRefIdx = visibleRefIndexByMessage.get(idx);
                 const keyPrefix = options.keyPrefix ?? "message";
-                // Not the entry id alone: a message sent or streamed in this run
-                // gets its id only when the file is read again (#1184).
                 const messageKey = messageKeys[idx];
                 let showTimestamp = false;
                 if (msg.role === "assistant") {
@@ -1178,32 +1165,32 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
                   }
                 }
                 if (options.showTimestamp !== undefined) showTimestamp = options.showTimestamp;
-                const view = (
-                  <MessageView
-                    key={`${keyPrefix}-view-${messageKey}`}
-                    message={msg}
-                    toolResults={toolResultsMap}
-                    modelNames={modelNames}
-                    cwd={messageCwd}
-                    onOpenFile={onOpenFile}
-                    onOpenSubagent={onOpenSubagent}
-                    entryId={entryIds[idx]}
-                    searchBlock={entryIds[idx] === pendingSearchScroll?.entryId ? searchBlock : undefined}
-                    onFork={capabilities.fork && !bashRunning && !isNew ? handleFork : undefined}
-                    forking={forkingEntryId === entryIds[idx]}
-                    onEditContent={sessionBusy || !capabilities.treeBranch ? undefined : handleEditContent}
-                    onCancelEdit={cancelEdit}
-                    isEditing={editEntryId === entryIds[idx]}
-                    showTimestamp={showTimestamp}
-                    prevTimestamp={idx > 0 ? (messages[idx - 1] as AgentMessage & { timestamp?: number }).timestamp : undefined}
-                    sessionId={session?.id ?? sessionIdRef.current ?? undefined}
-                    writtenFiles={options.writtenFiles}
-                    turnDurationMs={options.turnDurationMs}
-                    onCompact={options.recoverTruncation && capabilities.compact ? handleCompact : undefined}
-                    isCompacting={options.recoverTruncation ? isCompacting : undefined}
-                    compactError={options.recoverTruncation ? compactError : undefined}
-                  />
-                );
+                const viewProps: ComponentProps<typeof MessageView> = {
+                  message: msg,
+                  toolResults: toolResultsMap,
+                  modelNames,
+                  cwd: messageCwd,
+                  onOpenFile,
+                  onOpenSubagent,
+                  entryId: entryIds[idx],
+                  searchBlock: entryIds[idx] === pendingSearchScroll?.entryId ? searchBlock : undefined,
+                  onFork: backend !== "codex" && capabilities.fork && !bashRunning && !isNew ? handleFork : undefined,
+                  forking: forkingEntryId === entryIds[idx],
+                  onEditContent: sessionBusy || !capabilities.treeBranch ? undefined : handleEditContent,
+                  onCancelEdit: cancelEdit,
+                  isEditing: editEntryId === entryIds[idx],
+                  showTimestamp,
+                  prevTimestamp: idx > 0 ? (messages[idx - 1] as AgentMessage & { timestamp?: number }).timestamp : undefined,
+                  sessionId: session?.id ?? sessionIdRef.current ?? undefined,
+                  writtenFiles: options.writtenFiles,
+                  turnDurationMs: options.turnDurationMs,
+                  onCompact: options.recoverTruncation && capabilities.compact ? handleCompact : undefined,
+                  isCompacting: options.recoverTruncation ? isCompacting : undefined,
+                  compactError: options.recoverTruncation ? compactError : undefined,
+                };
+                const view = isCodexSessionId(session?.id ?? sessionIdRef.current) && msg.role === "assistant"
+                  ? <StreamAwareMessageView key={`${keyPrefix}-view-${messageKey}`} store={streamingStore} streamKey={messageItemIds[idx]} {...viewProps} />
+                  : <MessageView key={`${keyPrefix}-view-${messageKey}`} {...viewProps} />;
                 const noticeLines = notices.length > 0 ? <TranscriptNoticeLines key={`${keyPrefix}-notices-${messageKey}`} notices={notices} /> : null;
                 // One shape with or without notices, so lines arriving on a reload do not remount the view.
                 if (!isVisible || currentRefIdx === undefined) return <Fragment key={`${keyPrefix}-${messageKey}`}>{view}{noticeLines}</Fragment>;
@@ -1364,7 +1351,7 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
               );
             })()}
             {isStreaming && hasStreamingContent && (
-              <StreamingReply store={streamingStore} onCommit={updatePromptAnchor} toolResults={toolResultsMap} modelNames={modelNames} cwd={messageCwd} onOpenFile={onOpenFile} onOpenSubagent={onOpenSubagent} />
+              <StreamingReply store={streamingStore} representedIds={isCodexSessionId(session?.id ?? sessionIdRef.current) ? messageItemIds : undefined} onCommit={updatePromptAnchor} toolResults={toolResultsMap} modelNames={modelNames} cwd={messageCwd} onOpenFile={onOpenFile} onOpenSubagent={onOpenSubagent} />
             )}
 
             {(agentRunning || isCompacting) && !hasStreamingContent && (agentPhase || isCompacting) && (
@@ -1399,7 +1386,7 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
         {isMobile || pendingScrollRestore ? null : (
           <ChatMinimap
             messages={messages}
-            getStreamingMessage={getStreamingMessage}
+            getStreamingMessages={getStreamingMessages}
             scrollContainer={scrollContainerRef}
             messageRefs={messageRefs}
             onRevealHistory={revealHistoryForMinimap}
@@ -1543,7 +1530,10 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
             </div>
           </div>
         )}
-        {chatInputElement}
+        {session && sessionBackend(session) !== "pi" && sessionBackend(session) !== "claude"
+          && !(sessionBackend(session) === "codex" && (session.capabilities as { prompt?: boolean } | undefined)?.prompt === true && backends.codex?.available)
+          ? <div className="px-4 py-3 text-center text-sm text-text-muted">{t("chat.historyReadOnly")}</div>
+          : chatInputElement}
         <ExtensionStatusBar
           statuses={extensionStatuses}
           widgets={extensionWidgets}
@@ -1568,17 +1558,29 @@ function SideChatDivider() {
   );
 }
 
-const StreamingReply = memo(function StreamingReply({ store, onCommit, toolResults, modelNames, cwd, onOpenFile, onOpenSubagent }: {
+type StreamingReplyProps = {
   store: StreamingStore;
-  /** Runs after each chunk is in the DOM. */
+  representedIds?: readonly (string | null)[];
   onCommit: () => void;
   toolResults: Map<string, ToolResultMessage>;
   modelNames: Record<string, string>;
   cwd?: string;
   onOpenFile?: (filePath: string, page?: number) => void;
   onOpenSubagent?: (sessionId: string, label: string) => void;
-}) {
-  const message = useStreamingSelector(store, selectStreamingMessage);
+};
+const StreamAwareMessageView = memo(function StreamAwareMessageView({ store, streamKey, ...props }: ComponentProps<typeof MessageView> & { store: StreamingStore; streamKey: string | null }) {
+  const select = useCallback((state: ReturnType<StreamingStore["getState"]>) => streamKey ? state.streams.get(streamKey) ?? null : null, [streamKey]);
+  const streaming = useStreamingSelector(store, select, streamKey ?? undefined);
+  return <MessageView {...props} message={streaming ?? props.message} isStreaming={streaming !== null} />;
+});
+
+const StreamingReply = memo(function StreamingReply(props: StreamingReplyProps) {
+  const keys = useStreamingSelector(props.store, selectStreamingKeys);
+  return keys.filter(key => !props.representedIds?.includes(key)).map(key => <StreamingReplyItem key={key} {...props} streamKey={key} />);
+});
+const StreamingReplyItem = memo(function StreamingReplyItem({ store, streamKey, onCommit, toolResults, modelNames, cwd, onOpenFile, onOpenSubagent }: StreamingReplyProps & { streamKey: string }) {
+  const select = useCallback((state: ReturnType<StreamingStore["getState"]>) => state.streams.get(streamKey) ?? null, [streamKey]);
+  const message = useStreamingSelector(store, select, streamKey);
   useLayoutEffect(onCommit, [message, onCommit]);
   if (!message) return null;
   return <MessageView message={message} toolResults={toolResults} isStreaming modelNames={modelNames} cwd={cwd} onOpenFile={onOpenFile} onOpenSubagent={onOpenSubagent} />;

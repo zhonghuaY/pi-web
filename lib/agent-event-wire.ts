@@ -183,6 +183,7 @@ export function toClientAgentEvent(
     if (!("partial" in assistantMessageEvent)) {
       return {
         type: "message_update",
+        ...(typeof event.entryId === "string" ? { entryId: event.entryId } : {}),
         assistantMessageEvent,
       } as ClientMessageUpdateEvent;
     }
@@ -192,6 +193,7 @@ export function toClientAgentEvent(
     void _partial;
     return {
       type: "message_update",
+      ...(typeof event.entryId === "string" ? { entryId: event.entryId } : {}),
       assistantMessageEvent: metadata ? { ...deltaEvent, ...metadata } : deltaEvent,
     } as ClientMessageUpdateEvent;
   }

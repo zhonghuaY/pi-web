@@ -18,11 +18,9 @@ const repo = join(root, "repo");
 const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
 const previousOffline = process.env.PI_OFFLINE;
 const preservedEnv = {};
-for (const key of ["DEEPSEEK_API_KEY", "OPENROUTER_API_KEY", "OPENCODE_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"]) {
-  if (key in process.env) {
-    preservedEnv[key] = process.env[key];
-    delete process.env[key];
-  }
+for (const key of ["DEEPSEEK_API_KEY", "OPENROUTER_API_KEY", "OPENCODE_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_OAUTH_TOKEN"]) {
+  preservedEnv[key] = process.env[key];
+  delete process.env[key];
 }
 process.env.PI_CODING_AGENT_DIR = agentDir;
 // The list is served from the SDK's own data and the models.json below, so the route
@@ -61,7 +59,8 @@ allowFileRoot(repo);
 
 after(async () => {
   for (const [key, val] of Object.entries(preservedEnv)) {
-    process.env[key] = val;
+    if (val === undefined) delete process.env[key];
+    else process.env[key] = val;
   }
   if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
   else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
@@ -164,5 +163,21 @@ test("honors ?scope=all on demand and reports isScoped accurately", async () => 
   } finally {
     await rm(join(agentDir, "settings.json"), { force: true });
     invalidateModelsCache();
+  }
+});
+
+test('explicit native models dispatch never returns Pi fallback metadata', async () => {
+  const previousCodexEnabled = process.env.PI_WEB_CODEX;
+  process.env.PI_WEB_CODEX = '0';
+  try {
+    const response = await GET(new Request(`http://localhost/api/models?backend=codex&cwd=${encodeURIComponent(repo)}`));
+    assert.equal(response.status, 503);
+    const body = await response.json();
+    assert.equal(body.error, 'Codex is disabled');
+    assert.equal('thinkingLevels' in body, false);
+    assert.equal('modelList' in body, false);
+  } finally {
+    if (previousCodexEnabled === undefined) delete process.env.PI_WEB_CODEX;
+    else process.env.PI_WEB_CODEX = previousCodexEnabled;
   }
 });

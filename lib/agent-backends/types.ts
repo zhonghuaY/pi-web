@@ -1,6 +1,7 @@
 import type { AgentMessage, SessionContext, SessionInfo } from "../types";
+import { parseSessionKey, type BackendId } from "../session-identity";
 
-export type AgentBackend = "pi" | "claude";
+export type AgentBackend = BackendId;
 
 const CLAUDE_SESSION_ID = /^claude:([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/i;
 const NATIVE_SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -25,7 +26,9 @@ export function claudeWebSessionId(nativeId: string): string {
 }
 
 export function getSessionBackend(id: string): AgentBackend {
-  return isClaudeSessionId(id) ? "claude" : "pi";
+  const parsed = parseSessionKey(id);
+  if (!parsed.ok || parsed.key.backend === "codex") throw new Error("Invalid or unsupported session id");
+  return parsed.key.backend;
 }
 
 export interface AgentBackendCapabilities {
@@ -40,6 +43,7 @@ export interface AgentBackendCapabilities {
   export: boolean;
   compact: boolean;
   mcp: boolean;
+  skills?: boolean;
   side: boolean;
   toolPresets: boolean;
   forkAtEntry: boolean;
@@ -95,6 +99,8 @@ export interface AgentInteractionQuestion {
   question: string;
   header?: string;
   multiSelect?: boolean;
+  isSecret?: boolean;
+  isOther?: boolean;
   options: AgentInteractionOption[];
 }
 
@@ -105,6 +111,7 @@ export interface AgentInteractionRequest {
   title: string;
   toolName?: string;
   input?: Record<string, unknown>;
+  approvalOptions?: { accept: boolean; decline: boolean };
   questions?: AgentInteractionQuestion[];
 }
 

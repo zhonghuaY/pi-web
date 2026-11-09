@@ -228,7 +228,8 @@ export function AppShell() {
   useEffect(() => {
     if (!selectedSession) return;
     setBackendScope((current) => {
-      const backend = sessionBackend(selectedSession);
+      const resolvedBackend = sessionBackend(selectedSession);
+      const backend = resolvedBackend === "pi" || resolvedBackend === "claude" ? resolvedBackend : current.backend;
       const capabilities = sessionCapabilities(selectedSession);
       return mergeAgentBackendScope(current, { ...current, backend, capabilities });
     });

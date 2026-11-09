@@ -71,7 +71,10 @@ async function setup() {
     throw new Error(`unexpected fetch ${url} ${init.body ?? ""}`);
   };
 
-  const hook = renderHook(useAgentSession, { session: { id: "s1", name: "S", cwd: "/project" } });
+  const hook = renderHook(useAgentSession, {
+    session: { id: "s1", name: "S", cwd: "/project" },
+    t: (key) => key,
+  });
   await settle();
   hook.flush();
   const stream = () => sources.find((source) => source.readyState !== 2);

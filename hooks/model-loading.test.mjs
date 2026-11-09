@@ -7,7 +7,7 @@ import { createJiti } from "jiti";
 
 const jiti = createJiti(import.meta.url, { interopDefault: true, moduleCache: false });
 const { missingCwdFromBody } = await jiti.import("../lib/missing-cwd.ts");
-const { validatePiSessionChoices } = await jiti.import("../lib/agent-session-choices.ts");
+const { parseCodexModels, isClaudeEffort, codexSelectionForModel, validatePiSessionChoices } = await jiti.import("../lib/agent-session-choices.ts");
 
 const source = ts.createSourceFile(
   "useAgentSession.ts",
@@ -48,6 +48,9 @@ function setup(fetchImpl) {
   const delays = [];
   const context = {
     Error, DOMException,
+    modelsGenerationRef: { current: 0 },
+    codexDraftRef: { current: null },
+    parseCodexModels, isClaudeEffort, codexSelectionForModel,
     controller: new AbortController(),
     newSessionCwd: "/project", session: null, isNew: true, backend: "pi", backendRef: { current: "pi" },
     sessionIdRef: { current: null }, thinkingLevelOverrideRef: { current: null }, newSessionModelOverrideRef: { current: null },
@@ -63,7 +66,7 @@ function setup(fetchImpl) {
     MODELS_RETRY_DELAYS_MS: script(schedule.initializer.getText(source)).runInNewContext(),
     delay: async (ms) => { delays.push(ms); },
   };
-  for (const name of ["ModelError", "ModelsMissingCwd", "ModelNames", "ModelScopeWarnings", "IsModelScopeActive", "AllModelList", "ModelThinkingLevels", "ModelThinkingLevelMaps", "ModelList", "NewSessionDefaultModel", "NewSessionDefaultThinkingLevel", "SavedDefaultThinkingLevel", "NewSessionModel", "NewSessionThinkingLevel", "EffectiveNativeModel"]) {
+  for (const name of ["ModelError", "ModelsMissingCwd", "ModelNames", "ModelScopeWarnings", "IsModelScopeActive", "AllModelList", "ModelThinkingLevels", "ModelThinkingLevelMaps", "ModelList", "NewSessionDefaultModel", "NewSessionDefaultThinkingLevel", "SavedDefaultThinkingLevel", "NewSessionModel", "NewSessionThinkingLevel", "EffectiveNativeModel", "CodexModelChoices", "CodexDraft"]) {
     context[`set${name}`] = (value) => writes.push([name, value]);
   }
   context.loadModels = loadScript.runInNewContext(context);
@@ -320,4 +323,34 @@ test("returning from Claude to Pi reloads the cwd catalogue and rejects stale ca
   assert.equal(state.context.thinkingLevelOverrideRef.current, null);
   assert.ok(state.writes.some(([name, value]) => name === "NewSessionModel" && value === null));
   assert.ok(state.writes.some(([name, value]) => name === "NewSessionThinkingLevel" && value === null));
+});
+
+test('Codex discovery uses native model identifier and never Pi fallback', async () => {
+  const urls = [];
+  const rows = [{ id: 'catalogue-id', model: 'native-model', label: 'Native', isDefault: true, defaultEffort: 'low', efforts: [{ value: 'low', description: 'Low' }, { value: 'ultra', description: 'Ultra' }] }];
+  const { context, writes } = setup(async url => { urls.push(url); return { ok: true, json: async () => ({ backend: 'codex', models: rows }) }; });
+  context.backend = 'codex'; context.backendRef.current = 'codex';
+  context.codexDraftRef.current = { model: 'native-model', effort: 'ultra' };
+  await context.loadModels();
+  assert.deepEqual(urls, ['/api/models?backend=codex&cwd=%2Fproject']);
+  const list = writes.find(([key]) => key === 'ModelList')[1];
+  assert.equal(list[0].id, 'native-model'); assert.equal(list[0].provider, 'codex');
+  assert.equal(context.codexDraftRef.current.effort, 'ultra');
+  assert.equal(writes.some(([key, val]) => key === 'NewSessionDefaultModel' && val !== null), false);
+});
+
+test('Codex catalogue failure remains native and stale responses cannot write a new scope', async () => {
+  let settle;
+  const { context, writes } = setup(() => new Promise(resolve => { settle = resolve; }));
+  context.backend = 'codex'; context.backendRef.current = 'codex';
+  const loading = context.loadModels();
+  context.backendRef.current = 'pi';
+  settle({ ok: false, json: async () => ({ error: 'native unavailable' }) });
+  await loading;
+  assert.equal(writes.some(([key]) => key === 'ModelError'), false);
+  context.backendRef.current = 'codex';
+  const failed = context.loadModels();
+  settle({ ok: false, json: async () => ({ error: 'native unavailable' }) });
+  await assert.rejects(failed, /native unavailable/);
+  assert.equal(writes.some(([key, value]) => key === 'ModelError' && value === 'native unavailable'), true);
 });

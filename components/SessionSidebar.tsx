@@ -2,6 +2,8 @@
 
 import { useEffect, useImperativeHandle, useLayoutEffect, useState, useCallback, useMemo, useRef, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent, type ReactNode, type Ref, type RefObject, type UIEvent as ReactUIEvent } from "react";
 import type { SessionInfo } from "@/lib/types";
+import { sessionBackend, sessionCapabilities } from "@/lib/agent-backends";
+import { parseSessionKey } from "@/lib/session-identity";
 import { listSessionFamilies, type SessionFamily, isHiddenRelation } from "@/lib/session-family";
 import { dispatchSessionRowContextMenu } from "@/lib/session-row-context-menu";
 import { newSessionDeepLink, sessionDeepLink } from "@/lib/session-links";
@@ -9,7 +11,7 @@ import { getProjectActivity, getRecentProjects } from "@/lib/project-groups";
 import { workspaceKeyOf } from "@/lib/workspace-memory";
 import {
   adjacentProjectMove,
-  archivedFamilyIds,
+  archiveBulkActionIds,
   buildArchiveRows,
   buildSessionTree,
   effectiveGroupExpansion,
@@ -771,10 +773,18 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
         runningSessionIds?: string[];
         awaitingInputSessionIds?: string[];
         completionNotificationSuppressedSessionIds?: string[];
+        backendErrors?: Record<string, string>;
       };
       if (loadId !== sessionLoadIdRef.current) return;
       sessionListVersionRef.current = data.sessionListVersion;
-      setAllSessions(data.sessions);
+      setAllSessions((previous) => {
+        const ids = new Set(data.sessions.map((session) => session.id));
+        const retained = previous.filter((session) => {
+          const backend = sessionBackend(session);
+          return backend !== null && Boolean(data.backendErrors?.[backend]) && !ids.has(session.id);
+        });
+        return retained.length === 0 ? data.sessions : [...data.sessions, ...retained].sort((a, b) => b.modified.localeCompare(a.modified));
+      });
       if (!summary) setSessionDetailsLoaded(true);
       // Treat the fetched running set as an initial fallback only. Once the
       // lightweight poll is live, a slow session-list fetch cannot overwrite it.
@@ -793,12 +803,17 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
           .filter((session) => !isHiddenRelation(session.relation))
           .map((session) => session.id),
       );
+      const listedIds = new Set(data.sessions.map((session) => session.id));
       setUnreadSessionIds((prev) => {
         if (prev.size === 0) return prev;
-        const next = new Set([...prev].filter((id) => unreadEligibleIds.has(id)));
+        const next = new Set([...prev].filter((id) => {
+          if (unreadEligibleIds.has(id)) return true;
+          const key = parseSessionKey(id);
+          return !listedIds.has(id) && key.ok && Boolean(data.backendErrors?.[key.key.backend]);
+        }));
         return next.size === prev.size ? prev : next;
       });
-      setError(null);
+      setError(Object.values(data.backendErrors ?? {}).filter(Boolean).join(" · ") || null);
     } catch (e) {
       if (loadId === sessionLoadIdRef.current) setError(String(e));
     } finally {
@@ -2193,16 +2208,16 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
     });
   }, []);
 
-  const archiveDeleteIds = useCallback((scope: ArchiveDeleteScope | { projectKey: string }) => archivedFamilyIds(
+  const archiveActionIds = useCallback((scope: ArchiveDeleteScope | { projectKey: string }) => archiveBulkActionIds(
     treeSelectionInput,
     scope === "all" ? {} : scope === "old" ? { archivedBefore: Date.now() - ARCHIVED_DELETE_AFTER_MS } : scope,
   ), [treeSelectionInput]);
 
   const deleteArchived = useCallback((scope: ArchiveDeleteScope | { projectKey: string }) => {
-    const ids = archiveDeleteIds(scope);
+    const ids = archiveActionIds(scope).delete;
     const runKey = typeof scope === "string" ? `archive:${scope}` : `archive-project:${scope.projectKey}`;
     void deleteFamilyIds(runKey, ids, () => (typeof scope === "string" ? archiveHeaderButton(null) : archiveHeaderButton(scope.projectKey)));
-  }, [archiveDeleteIds, archiveHeaderButton, deleteFamilyIds]);
+  }, [archiveActionIds, archiveHeaderButton, deleteFamilyIds]);
 
   // Folding the archive's projects: one header, or (Alt+click, the bar's
   // menu) every one of them. Saved per browser, the newest choice last.
@@ -2357,7 +2372,7 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
     else filesPickerRef.current?.button("project")?.focus({ preventScroll: true });
   }, [filesShown, filesFocusRequest]);
 
-  const sessionMenuItems = (row: SessionRow): SidebarMenuItem[] => sessionMenuEntries(row.context, row.status).map((entry, index) => {
+  const sessionMenuItems = (row: SessionRow): SidebarMenuItem[] => sessionMenuEntries(row.context, row.status, sessionCapabilities(row.family.root)).map((entry, index) => {
     if (entry.kind === "separator") return { type: "separator", id: `separator-${index}` };
     const label = t(SESSION_ACTION_LABEL_KEYS[entry.id]);
     return {
@@ -2526,24 +2541,24 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
   };
 
   const archiveGroupMenuItems = (project: SidebarProject): SidebarMenuItem[] => {
-    const ids = archiveDeleteIds({ projectKey: project.key });
+    const ids = archiveActionIds({ projectKey: project.key });
     return [
       {
         type: "item",
         id: "restore-all",
-        label: t("sidebar.restoreAllArchived", { count: ids.length }),
+        label: t("sidebar.restoreAllArchived", { count: ids.restore.length }),
         icon: <RestoreIcon />,
-        disabled: ids.length === 0,
-        onSelect: () => restoreFamilies(familiesOf(ids)),
+        disabled: ids.restore.length === 0,
+        onSelect: () => restoreFamilies(familiesOf(ids.restore)),
       },
       { type: "separator", id: "separator-delete" },
       {
         type: "item",
         id: "delete-all",
-        label: t("sidebar.deleteAllArchived", { count: ids.length }),
+        label: t("sidebar.deleteAllArchived", { count: ids.delete.length }),
         icon: <TrashIcon />,
         danger: true,
-        disabled: ids.length === 0,
+        disabled: ids.delete.length === 0,
         onSelect: ({ keepOpen }) => {
           keepOpen();
           askArchiveDelete("all");
@@ -2553,8 +2568,8 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
   };
 
   const archiveMenuItems = (): SidebarMenuItem[] => {
-    const all = archiveDeleteIds("all");
-    const old = archiveDeleteIds("old");
+    const all = archiveActionIds("all");
+    const old = archiveActionIds("old");
     const folded = archiveGroups.filter((row) => !row.expanded).length;
     return [
       {
@@ -2577,18 +2592,18 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
       {
         type: "item",
         id: "restore-all",
-        label: t("sidebar.restoreAllArchived", { count: all.length }),
+        label: t("sidebar.restoreAllArchived", { count: all.restore.length }),
         icon: <RestoreIcon />,
-        disabled: all.length === 0,
-        onSelect: () => restoreFamilies(familiesOf(all)),
+        disabled: all.restore.length === 0,
+        onSelect: () => restoreFamilies(familiesOf(all.restore)),
       },
       {
         type: "item",
         id: "delete-old",
-        label: t("sidebar.deleteOldArchived", { count: old.length }),
+        label: t("sidebar.deleteOldArchived", { count: old.delete.length }),
         icon: <TrashIcon />,
         danger: true,
-        disabled: old.length === 0,
+        disabled: old.delete.length === 0,
         onSelect: ({ keepOpen }) => {
           keepOpen();
           askArchiveDelete("old");
@@ -2597,10 +2612,10 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
       {
         type: "item",
         id: "delete-all",
-        label: t("sidebar.deleteAllArchived", { count: all.length }),
+        label: t("sidebar.deleteAllArchived", { count: all.delete.length }),
         icon: <TrashIcon />,
         danger: true,
-        disabled: all.length === 0,
+        disabled: all.delete.length === 0,
         onSelect: ({ keepOpen }) => {
           keepOpen();
           askArchiveDelete("all");
@@ -2615,7 +2630,7 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
       : t(scope === "old" ? "sidebar.deleteOldArchivedHeading" : "sidebar.deleteAllArchivedHeading"),
     headingTitle: project?.root,
     notes: [t("sidebar.deleteArchivedMessage")],
-    count: archiveDeleteIds(scope).length,
+    count: archiveActionIds(scope).delete.length,
     onConfirm: () => deleteArchived(scope),
     onCancel: () => askArchiveDelete(undefined),
   });

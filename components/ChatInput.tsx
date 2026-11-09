@@ -1,10 +1,13 @@
 "use client";
 
+import type { ReasoningControl } from "@/lib/agent-session-choices";
+
 import React, { memo, useRef, useState, useCallback, useEffect, useLayoutEffect, useImperativeHandle, forwardRef, KeyboardEvent } from "react";
 import type { BuiltinSlashCommandResult, CompactResultInfo, QueuedMessages, SlashCommandInfo } from "@/hooks/useAgentSession";
 import type { SkillsResponse } from "@/lib/api-types";
 import type { TextContent, UserMessage } from "@/lib/types";
 import { shouldHandleWebSlashCommand, type AgentBackend, type AgentBackends, type AgentCapabilities } from "@/lib/agent-backends";
+import { isHandoffEdge } from "@/lib/session-identity";
 import {
   clearDraft,
   getDraft,
@@ -65,6 +68,7 @@ interface Props {
   /** An existing session creates a linked native session when this changes. */
   backendHandoff?: boolean;
   backendChanging?: boolean;
+  handoffTargetBackend?: AgentBackend | null;
   effectiveNativeModel?: string | null;
   shellCommandsEnabled?: boolean;
   /** Text-only composer without the session controls or outer spacing. */
@@ -97,16 +101,7 @@ interface Props {
   compactResult?: CompactResultInfo | null;
   toolPreset?: ToolPreset;
   onToolPresetChange?: (preset: ToolPreset) => void;
-  thinkingLevel?: "auto" | "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
-  /** New session has not committed a thinking level; the button still shows the resolved default. */
-  isAutoThinkingSelection?: boolean;
-  onThinkingLevelChange?: (level: "auto" | "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max") => void;
-  availableThinkingLevels?: string[] | null;
-  thinkingLevelMap?: Record<string, string | null> | null;
-  /** `defaultThinkingLevel` saved in settings, starred in the reasoning menu. */
-  savedDefaultThinkingLevel?: string | null;
-  /** Saves a reasoning level as the default for new sessions and selects it here. */
-  onSetDefaultThinkingLevel?: (level: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max") => void;
+  reasoning?: ReasoningControl | null;
   retryInfo?: { attempt: number; maxAttempts: number; errorMessage?: string } | null;
   queuedMessages?: QueuedMessages | null;
   inputHistory?: string[];
@@ -301,12 +296,6 @@ function subscribeUpwardMenuMaxHeight(
   };
 }
 
-const THINKING_LEVELS = ["auto", "off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
-const THINKING_LEVEL_DESC_KEYS: Record<typeof THINKING_LEVELS[number], string> = {
-  auto: "chat.thinkingUseDefault", off: "chat.thinkingOff", minimal: "chat.thinkingMinimal", low: "chat.thinkingLow",
-  medium: "chat.thinkingMedium", high: "chat.thinkingHigh", xhigh: "chat.thinkingXhigh", max: "chat.thinkingMax",
-};
-
 function formatTokenCount(tokens: number): string {
   if (tokens >= 1_000_000) return `${(tokens / 1_000_000).toFixed(1)}M`;
   if (tokens >= 1_000) return `${Math.round(tokens / 1_000)}k`;
@@ -347,6 +336,7 @@ export function getVisibleBuiltinSlashCommands(
     ? BUILTIN_SLASH_COMMANDS.filter((command) => command.availableWhileStreaming)
     : BUILTIN_SLASH_COMMANDS;
   return commands.filter((command) => {
+    if (backend === "codex" && command.name === "auto-compact") return false;
     if (!shouldHandleWebSlashCommand(backend, command.name)) return false;
     if (!capabilities) return true;
     if (command.name === "compact" || command.name === "auto-compact") return capabilities.compact;
@@ -569,9 +559,8 @@ export function getUserMessageDraftImages(message: UserMessage): ChatDraftImage[
     if (block.type !== "image") return [];
 
     // Support both the current nested image format and older flat pi-ai entries.
-    const flat = block as unknown as { data?: unknown; mimeType?: unknown };
-    const data = block.source?.type === "base64" ? block.source.data : flat.data;
-    const mimeType = block.source?.type === "base64" ? block.source.media_type : flat.mimeType;
+    const data = block.source?.type === "base64" ? block.source.data : "data" in block ? block.data : undefined;
+    const mimeType = block.source?.type === "base64" ? block.source.media_type : "mimeType" in block ? block.mimeType : undefined;
     if (typeof data !== "string" || typeof mimeType !== "string") return [];
 
     const image = { data, mimeType };
@@ -723,11 +712,10 @@ export function ModelScopeWarningBanner({ warnings }: { warnings?: string[] }) {
 // Memoized: its props hold still while a reply streams or a tool runs, and the
 // chat around it re-renders through both.
 export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatInput({
-  onSend, onAbort, onSteer, onSideChat, onFollowUp, isStreaming, backend = "pi", backends, backendsLoading = false, backendsError, onRetryBackends, capabilities, onBackendChange, backendHandoff = false, backendChanging = false, effectiveNativeModel, shellCommandsEnabled = true, model, isAutoModelSelection, modelNames, modelList, modelError, missingCwd, modelScopeWarnings, allModelList, onLoadAllModels, onLoadModels, onModelChange, modelSwitching,
+  onSend, onAbort, onSteer, onSideChat, onFollowUp, isStreaming, backend = "pi", backends, backendsLoading = false, backendsError, onRetryBackends, capabilities, onBackendChange, backendHandoff = false, backendChanging = false, handoffTargetBackend = null, effectiveNativeModel, shellCommandsEnabled = true, model, isAutoModelSelection, modelNames, modelList, modelError, missingCwd, modelScopeWarnings, allModelList, onLoadAllModels, onLoadModels, onModelChange, modelSwitching,
   defaultModel, onSetDefaultModel,
   onCompact, onAbortCompaction, isCompacting, compactError, onDismissCompactError, compactResult, toolPreset, onToolPresetChange,
-  thinkingLevel, isAutoThinkingSelection = false, onThinkingLevelChange, availableThinkingLevels, thinkingLevelMap,
-  savedDefaultThinkingLevel, onSetDefaultThinkingLevel,
+  reasoning,
   retryInfo, queuedMessages, inputHistory = [], onRecallQueue,
   slashCommands, slashCommandsLoading, onLoadSlashCommands,
   onBuiltinCommand,
@@ -1676,7 +1664,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
   // palette opens, so toggles made in the skills panel are reflected on the
   // next open. Failures degrade silently to the unannotated palette.
   useEffect(() => {
-    if (!slashMenuOpen || !cwd) return;
+    if (backend === "codex" || !slashMenuOpen || !cwd) return;
     const requestCwd = cwd;
     let cancelled = false;
     setSkillDormancyState({ cwd: requestCwd, values: {} });
@@ -1697,7 +1685,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
     return () => {
       cancelled = true;
     };
-  }, [slashMenuOpen, cwd]);
+  }, [backend, slashMenuOpen, cwd]);
 
   useEffect(() => {
     if (slashActiveIndex >= displayedSlashCommands.length) {
@@ -1756,12 +1744,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
   const compactResultText = compactResult
     ? `${compactResult.reason && compactResult.reason !== "manual" ? `${compactResult.reason[0].toUpperCase()}${compactResult.reason.slice(1)} ` : t("chat.compacted")} ${formatTokenCount(compactResult.tokensBefore)} -> ${formatTokenCount(compactResult.estimatedTokensAfter)} tokens (${t("chat.tokensSaved", { saved: formatTokenCount(compactSavedTokens) })})`
     : null;
-  const resolvedThinkingLevel = thinkingLevel && thinkingLevel !== "auto" ? thinkingLevel : null;
-  const thinkingDisplayLabel = (() => {
-    const lvl = resolvedThinkingLevel ?? "auto";
-    if (lvl === "auto" || !thinkingLevelMap) return lvl;
-    return thinkingLevelMap[lvl] ?? lvl;
-  })();
+  const thinkingDisplayLabel = reasoning?.label ?? "";
   const rawToolPresetLabel = Object.entries(TOOL_PRESET_MAP).find(([, v]) => v === (toolPreset ?? "configured"))?.[0] ?? "configured";
   const toolPresetLabel = rawToolPresetLabel === "chat-only" ? t("chat.chatOnly") : rawToolPresetLabel;
 
@@ -2398,7 +2381,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
             onPaste={handlePaste}
             placeholder={
               isCompacting
-                ? t("chat.compactingPlaceholder")
+                ? t(backend === "codex" ? "chat.compacting" : "chat.compactingPlaceholder")
                 : isStreaming && (onSteer || onFollowUp)
                 ? t("chat.steerPlaceholder")
                 : isStreaming ? t("chat.agentPlaceholder")
@@ -2587,23 +2570,24 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
             </button>
             {onBackendChange ? (
               <select
-                value={backendHandoff && backendChanging ? (backend === "pi" ? "claude" : "pi") : backend}
+                value={backendHandoff && backendChanging && handoffTargetBackend ? handoffTargetBackend : backend}
                 onChange={(event) => {
                   const value = event.currentTarget.value;
-                  if (value === "pi" || value === "claude") onBackendChange(value);
+                  if (value === "pi" || value === "claude" || value === "codex") onBackendChange(value);
                 }}
                 disabled={isStreaming || backendsLoading || backendChanging}
                 aria-busy={backendChanging || undefined}
                 aria-label={t("chat.backend")}
-                title={backendHandoff ? t("chat.backendHandoff") : backends?.[backend].reason ?? t("chat.backend")}
+                title={backendHandoff ? t("chat.backendHandoff") : backends?.[backend]?.reason ?? t("chat.backend")}
                 style={{ height: 32, maxWidth: 112, border: "none", borderRadius: 9, background: "var(--bg-hover)", color: "var(--text)", padding: "0 8px", fontSize: 12 }}
               >
-                <option value="pi" disabled={backends?.pi.available === false}>Pi</option>
-                <option value="claude" disabled={backends?.claude.available === false}>Claude</option>
+                <option value="pi" disabled={backends?.pi.available === false || (backendHandoff && !isHandoffEdge(backend, "pi"))}>Pi</option>
+                <option value="claude" disabled={backends?.claude.available === false || (backendHandoff && !isHandoffEdge(backend, "claude"))}>Claude</option>
+                <option value="codex" disabled={backends?.codex?.available !== true || (backendHandoff && !isHandoffEdge(backend, "codex"))}>Codex</option>
               </select>
             ) : (
               <span title={t("chat.backendLocked")} style={{ padding: "0 6px", color: "var(--text-muted)", fontSize: 11, whiteSpace: "nowrap" }}>
-                {backend === "claude" ? "Claude" : "Pi"}
+                {backend === "claude" ? "Claude" : backend === "codex" ? "Codex" : "Pi"}
               </span>
             )}
             {backend === "claude" && !onModelChange && (
@@ -2705,9 +2689,19 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
                 backdropFilter: "blur(10px)",
               } : null),
             }}>
-            {onThinkingLevelChange && (
-              <div ref={thinkingDropdownRef} style={{ position: "relative" }}>
+            {reasoning && (
+              <div ref={thinkingDropdownRef} style={{ position: isMobile ? "static" : "relative" }}>
                 <button
+                  disabled={reasoning.disabled || reasoning.busy}
+                  aria-haspopup="listbox"
+                  aria-expanded={thinkingDropdownOpen}
+                  onKeyDown={(event) => {
+                    if (event.key === "Escape" && thinkingDropdownOpen) {
+                      event.preventDefault();
+                      event.stopPropagation();
+                      setThinkingDropdownOpen(false);
+                    }
+                  }}
                   onClick={() => setThinkingDropdownOpen((v) => !v)}
                   title={isStreaming
                     ? t("chat.currentReasoning", { level: thinkingDisplayLabel })
@@ -2743,58 +2737,37 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
                   {(!isMobile || controlsMenuOpen) && <span style={{ whiteSpace: "nowrap" }}>{thinkingDisplayLabel}</span>}
                 </button>
                 {thinkingDropdownOpen && (
-                  <div style={{
-                    position: "absolute", bottom: "calc(100% + 6px)",
-                    ...(isMobile ? { left: 0 } : { right: 0 }),
+                  <div role="listbox" aria-label={t("chat.changeReasoning", { level: thinkingDisplayLabel })} onKeyDown={(event) => {
+                    if (event.key === "Escape") {
+                      event.preventDefault();
+                      event.stopPropagation();
+                      setThinkingDropdownOpen(false);
+                      thinkingDropdownRef.current?.querySelector("button")?.focus();
+                    }
+                  }} style={{
+                    position: "absolute", bottom: "calc(100% + 6px)", right: 0,
                     zIndex: 100, background: "var(--bg)", border: "1px solid var(--border)",
                     borderRadius: 8, boxShadow: "0 -4px 16px rgba(0,0,0,0.10)",
-                    overflow: "hidden", minWidth: 180,
+                    overflow: "auto", minWidth: 180, maxWidth: "calc(100vw - 32px)", maxHeight: "50vh",
                   }}>
-                    {THINKING_LEVELS.filter((lvl) => {
-                      if (!availableThinkingLevels) return true;
-                      if (lvl === "auto") return true;
-                      return availableThinkingLevels.includes(lvl);
-                    }).map((lvl) => {
-                      const isActive = lvl === "auto"
-                        ? isAutoThinkingSelection
-                        : !isAutoThinkingSelection && resolvedThinkingLevel === lvl;
-                      const desc = t(THINKING_LEVEL_DESC_KEYS[lvl]);
-                      const mappedVal = (lvl !== "auto" && thinkingLevelMap) ? thinkingLevelMap[lvl] : undefined;
-                      const displayLabel = (mappedVal != null && mappedVal !== lvl) ? mappedVal : lvl;
-                      const showOriginal = mappedVal != null && mappedVal !== lvl;
-                      return (
-                        <SelectorRow
-                          key={lvl}
-                          active={isActive}
-                          onSelect={() => {
-                            setThinkingDropdownOpen(false);
-                            if (lvl === "auto") {
-                              if (!isAutoThinkingSelection) onThinkingLevelChange("auto");
-                              return;
-                            }
-                            if (!isActive || isAutoThinkingSelection) onThinkingLevelChange(lvl);
-                          }}
-                          gutter={Boolean(onSetDefaultThinkingLevel)}
-                          star={onSetDefaultThinkingLevel && lvl !== "auto"
-                            ? {
-                                isDefault: savedDefaultThinkingLevel === lvl,
-                                saveLabel: t("chat.saveDefaultThinking"),
-                                defaultLabel: t("chat.defaultThinking"),
-                                onSave: () => {
-                                  setThinkingDropdownOpen(false);
-                                  onSetDefaultThinkingLevel(lvl);
-                                },
-                              }
-                            : undefined}
-                        >
-                          <span style={{ flex: 1 }}>
-                            {displayLabel}
-                            {showOriginal && <span style={{ fontSize: 10, color: "var(--text-dim)", fontFamily: "var(--font-mono)", marginLeft: 5 }}>({lvl})</span>}
-                          </span>
-                          <span style={{ fontSize: 11, color: "var(--text-dim)", marginLeft: 8 }}>{desc}</span>
-                        </SelectorRow>
-                      );
-                    })}
+                    {reasoning.rows.map(row => (
+                      <SelectorRow
+                        key={row.key}
+                        active={row.selected}
+                        onSelect={() => {
+                          setThinkingDropdownOpen(false);
+                          if (!reasoning.disabled && !reasoning.busy && !row.selected) reasoning.onChange(row.choice);
+                        }}
+                        gutter={reasoning.rows.some(option => Boolean(option.star))}
+                        star={row.star ? { ...row.star, onSave: () => { setThinkingDropdownOpen(false); row.star?.onSave(); } } : undefined}
+                      >
+                        <span style={{ flex: 1 }}>
+                          {row.label}
+                          {row.originalLabel && <span style={{ fontSize: 10, color: "var(--text-dim)", fontFamily: "var(--font-mono)", marginLeft: 5 }}>({row.originalLabel})</span>}
+                        </span>
+                        <span style={{ fontSize: 11, color: "var(--text-dim)", marginLeft: 8, whiteSpace: "normal" }}>{row.description}</span>
+                      </SelectorRow>
+                    ))}
                   </div>
                 )}
               </div>
@@ -2892,6 +2865,8 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
             {(!isStreaming || isCompacting) && onCompact && (
               <div>
                 <button
+                  disabled={isCompacting && !onAbortCompaction}
+                  aria-busy={isCompacting || undefined}
                   onClick={isCompacting ? onAbortCompaction : (e) => { if (!isStrayClick(e)) onCompact(); }}
                   style={{
                     display: "flex", alignItems: "center", justifyContent: "center", gap: 5,
@@ -2914,11 +2889,11 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
                     e.currentTarget.style.background = isCompacting ? "rgba(239,68,68,0.08)" : "none";
                     e.currentTarget.style.color = isCompacting ? "#ef4444" : "var(--text-muted)";
                   }}
-                   title={isCompacting ? t("chat.stopCompaction") : t("chat.compactContext")}
-                   aria-label={isCompacting ? t("chat.stopCompaction") : t("chat.compactContext")}
+                   title={isCompacting ? t(onAbortCompaction ? "chat.stopCompaction" : "chat.compacting") : t("chat.compactContext")}
+                   aria-label={isCompacting ? t(onAbortCompaction ? "chat.stopCompaction" : "chat.compacting") : t("chat.compactContext")}
                 >
                   {isCompacting ? (
-                    <><svg width="10" height="10" viewBox="0 0 10 10" fill="none"><rect x="2" y="2" width="6" height="6" rx="1" fill="currentColor" /></svg>{(!isMobile || controlsMenuOpen) && <span style={{ whiteSpace: "nowrap" }}>{t("chat.compacting")}</span>}</>
+                    <>{onAbortCompaction ? <svg width="10" height="10" viewBox="0 0 10 10" fill="none"><rect x="2" y="2" width="6" height="6" rx="1" fill="currentColor" /></svg> : <span aria-hidden="true">…</span>}{(!isMobile || controlsMenuOpen) && <span style={{ whiteSpace: "nowrap" }}>{t("chat.compacting")}</span>}</>
                   ) : (
                     <><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                       <polyline points="4 14 10 14 10 20" /><polyline points="20 10 14 10 14 4" />

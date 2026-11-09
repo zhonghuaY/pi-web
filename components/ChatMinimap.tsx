@@ -15,8 +15,8 @@ import styles from "./ChatMinimap.module.css";
 
 interface Props {
   messages: AgentMessage[];
-  /** The reply being streamed, read when the turns are measured: it never re-renders the minimap. */
-  getStreamingMessage: () => Partial<AgentMessage> | null;
+  /** Streaming replies are read during measurement without re-rendering the minimap. */
+  getStreamingMessages: () => readonly Partial<AgentMessage>[];
   scrollContainer: RefObject<HTMLDivElement | null>;
   messageRefs: RefObject<(HTMLDivElement | null)[]>;
   onRevealHistory: () => void;
@@ -248,7 +248,7 @@ function layoutNodes(allNodes: NodeInfo[], minimapHeight: number): NodeLayout {
 
 export const ChatMinimap = memo(function ChatMinimap({
   messages,
-  getStreamingMessage,
+  getStreamingMessages,
   scrollContainer,
   messageRefs,
   onRevealHistory,
@@ -346,10 +346,7 @@ export const ChatMinimap = memo(function ChatMinimap({
       let refIndex = 0;
       let currentTurn: TurnInfo | null = null;
 
-      const streamingMessage = getStreamingMessage();
-      const allMessages: (AgentMessage | Partial<AgentMessage>)[] = streamingMessage
-        ? [...messagesRef.current, streamingMessage]
-        : messagesRef.current;
+      const allMessages: (AgentMessage | Partial<AgentMessage>)[] = [...messagesRef.current, ...getStreamingMessages()];
       for (const message of allMessages) {
         const isAnchor = isMessageGroupAnchor(message);
         if (!isAnchor && message.role !== "assistant") continue;
@@ -423,7 +420,7 @@ export const ChatMinimap = memo(function ChatMinimap({
         scrollEl.scrollTo({ top: Math.max(0, targetTop - targetOffset), behavior: "smooth" });
       }
     }, 150);
-  }, [getStreamingMessage, lockActiveNode, messageRefs, scrollContainer, syncActiveNode]);
+  }, [getStreamingMessages, lockActiveNode, messageRefs, scrollContainer, syncActiveNode]);
 
   useEffect(() => {
     const el = scrollContainer.current;

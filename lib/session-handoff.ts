@@ -1,4 +1,4 @@
-import type { AgentBackend } from "./agent-backends/types";
+import { backendLabels, isBackendId, type BackendId } from "./session-identity";
 import type { AgentMessage, CustomMessage, SessionInfo, UserMessage } from "./types";
 
 export const HANDOFF_CONTEXT_CUSTOM_TYPE = "Imported context";
@@ -15,7 +15,7 @@ export interface SessionHandoffMetadata {
   version: 1;
   requestId: string;
   sourceSessionId: string;
-  sourceBackend: AgentBackend;
+  sourceBackend: BackendId;
   sourceEntryId: string | null;
   sourceTitle: string;
 }
@@ -23,10 +23,10 @@ export interface SessionHandoffMetadata {
 export interface BuildSessionHandoffInput {
   requestId: string;
   sourceSessionId: string;
-  sourceBackend: AgentBackend;
+  sourceBackend: BackendId;
   sourceEntryId: string | null;
   sourceTitle: string;
-  targetBackend: AgentBackend;
+  targetBackend: BackendId;
   messages: readonly AgentMessage[];
   maxMessages?: number;
   maxCharacters?: number;
@@ -45,10 +45,6 @@ type TransferSegment = { index: number; text: string };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function isAgentBackend(value: unknown): value is AgentBackend {
-  return value === "pi" || value === "claude";
 }
 
 function normalizedTitle(value: string): string {
@@ -137,7 +133,7 @@ export function parseSessionHandoffMetadata(text: string): SessionHandoffMetadat
       || typeof value.sourceSessionId !== "string"
       || value.sourceSessionId.length === 0
       || value.sourceSessionId.length > 200
-      || !isAgentBackend(value.sourceBackend)
+      || !isBackendId(value.sourceBackend)
       || (value.sourceEntryId !== null && typeof value.sourceEntryId !== "string")
       || typeof value.sourceTitle !== "string"
       || value.sourceTitle.length > 500) return null;
@@ -165,10 +161,10 @@ export function sessionHandoffRelation(text: string): HandoffRelation | null {
   } : null;
 }
 
-export function sessionHandoffTitle(text: string, targetBackend?: AgentBackend): string | null {
+export function sessionHandoffTitle(text: string, targetBackend?: BackendId): string | null {
   const metadata = parseSessionHandoffMetadata(text);
   if (!metadata) return null;
-  const backend = targetBackend === undefined ? "another backend" : targetBackend === "claude" ? "Claude" : "Pi";
+  const backend = targetBackend === undefined ? "another backend" : backendLabels[targetBackend];
   return "Continue in " + backend + " · " + metadata.sourceTitle;
 }
 
@@ -207,8 +203,8 @@ export function buildSessionHandoff(input: BuildSessionHandoffInput): BuiltSessi
   const bounded = boundedSegments(input.messages, maxMessages, maxCharacters);
   if (bounded.selected.length === 0) throw new Error("The source session has no transferable visible context");
 
-  const sourceName = input.sourceBackend === "claude" ? "Claude" : "Pi";
-  const targetName = input.targetBackend === "claude" ? "Claude" : "Pi";
+  const sourceName = backendLabels[input.sourceBackend];
+  const targetName = backendLabels[input.targetBackend];
   const title = "Continue in " + targetName + " · " + sourceTitle;
   const omittedMessages = input.messages.length - bounded.selected.length;
   const prompt = [

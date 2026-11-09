@@ -1,3 +1,4 @@
+import { parseSessionKey } from "./session-identity";
 import type { SUBAGENT_CONTROL_TOOL_NAMES } from "./subagents";
 import type { SessionEntry, SessionMessage, ToolResultMessage } from "./types";
 
@@ -21,10 +22,10 @@ const PATH_REPORTING_TOOL_NAMES = new Set<string>([...CODING_TOOL_NAMES, ...SUBA
 // script saved, often straight from MCP results.
 const CODEMODE_STORE_ENTRY_TYPE = "codemode-store";
 
-const SESSION_ID_RE = /^(?:claude:)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
 export function isValidSessionId(sessionId: string | null): sessionId is string {
-  return !!sessionId && SESSION_ID_RE.test(sessionId);
+  const result = parseSessionKey(sessionId);
+  if (!result.ok || result.key.backend === "codex") return false;
+  return result.key.backend === "claude" || /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(result.key.nativeId);
 }
 
 function safeDecode(value: string): string {

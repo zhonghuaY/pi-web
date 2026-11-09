@@ -13,6 +13,7 @@
  */
 
 import { projectNameOf, type SidebarFamilyStatus, type SidebarProject, type SidebarRow } from "./session-tree";
+import type { AgentCapabilities } from "./agent-backends";
 import type { SessionUiStateRequest } from "./session-ui-state-shared";
 
 export type SessionMenuActionId =
@@ -40,32 +41,36 @@ export type SessionMenuEntry =
 export function sessionMenuEntries(
   context: Extract<SidebarRow, { kind: "session" }>["context"],
   status: SidebarFamilyStatus,
+  capabilities: Pick<AgentCapabilities, "rename" | "delete" | "fork"> = { rename: true, delete: true, fork: true },
 ): SessionMenuEntry[] {
   if (status.transient) return [];
   const openNewTab: SessionMenuEntry = { kind: "action", id: "open-new-tab", shortcut: "T" };
+  const mutableActions: SessionMenuEntry[] = [
+    ...(capabilities.rename ? [{ kind: "action" as const, id: "rename" as const, shortcut: "R" }] : []),
+    ...(capabilities.fork ? [{ kind: "action" as const, id: "fork" as const, shortcut: "F" }] : []),
+  ];
+  const deleteActions: SessionMenuEntry[] = capabilities.delete
+    ? [{ kind: "separator" }, { kind: "action", id: "delete", shortcut: "D" }]
+    : [];
   if (context === "archive") {
     return [
       { kind: "action", id: "unarchive", shortcut: "A" },
       { kind: "action", id: "pin", shortcut: "P" },
-      { kind: "action", id: "rename", shortcut: "R" },
-      { kind: "action", id: "fork", shortcut: "F" },
+      ...mutableActions,
       openNewTab,
-      { kind: "separator" },
-      { kind: "action", id: "delete", shortcut: "D" },
+      ...deleteActions,
     ];
   }
   return [
     { kind: "action", id: context === "pinned" ? "unpin" : "pin", shortcut: "P" },
-    { kind: "action", id: "rename", shortcut: "R" },
-    { kind: "action", id: "fork", shortcut: "F" },
+    ...mutableActions,
     { kind: "action", id: status.unread ? "mark-read" : "mark-unread", shortcut: "U" },
     // A running family would come straight back: archiving waits for the run.
     status.running
       ? { kind: "action", id: "archive", shortcut: "A", disabledReason: "running" }
       : { kind: "action", id: "archive", shortcut: "A" },
     openNewTab,
-    { kind: "separator" },
-    { kind: "action", id: "delete", shortcut: "D" },
+    ...deleteActions,
   ];
 }
 

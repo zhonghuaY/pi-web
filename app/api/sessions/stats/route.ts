@@ -1,13 +1,7 @@
 import { NextResponse } from "next/server";
-import { isClaudeKey, claudeBackend } from "@/lib/claude-routes";
+import { sessions } from "@/lib/backend-service";
 import { hasJsonContentType, isApiRequestAllowed } from "@/lib/request-security";
-import { getRpcSession } from "@/lib/rpc-manager";
-import { getSessionSettings, openSessionManager, resolveSessionPath } from "@/lib/session-reader";
-import { computeSessionStats, type SessionUsageSummary } from "@/lib/session-stats";
-import { computeSessionTotalActiveMs } from "@/lib/session-timing";
-import { sideOwnEntries } from "@/lib/side-session";
 import { SESSION_ID_PATTERN } from "@/lib/session-ui-state-shared";
-import type { SessionEntry } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
 
@@ -20,57 +14,8 @@ export const dynamic = "force-dynamic";
 const MAX_SESSION_STATS_IDS = 200;
 const NO_STORE = { "Cache-Control": "no-store" };
 
-type SessionManagerLike = ReturnType<typeof openSessionManager>;
-
-interface CachedSummary {
-  entryCount: number;
-  lastEntryId: string | undefined;
-  leafId: string | null;
-  summary: SessionUsageSummary;
-}
-
-const summaries = new WeakMap<SessionManagerLike, CachedSummary>();
-
 function refusal(status: number, error: string) {
   return NextResponse.json({ error }, { status, headers: NO_STORE });
-}
-
-async function readSummary(id: string): Promise<SessionUsageSummary | null> {
-  if (isClaudeKey(id)) {
-    const snapshot = await (await claudeBackend()).readClaudeSession(id);
-    if (!snapshot.stats) return null;
-    return {
-      tokens: snapshot.stats.tokens, cost: snapshot.stats.cost,
-      toolCalls: snapshot.stats.toolCalls, totalActiveMs: snapshot.totalActiveMs ?? 0,
-      ...(snapshot.context.model ? { model: snapshot.context.model } : {}),
-    };
-  }
-  const rpc = getRpcSession(id);
-  let sm: SessionManagerLike;
-  if (rpc?.isAlive()) {
-    sm = rpc.inner.sessionManager as SessionManagerLike;
-  } else {
-    const path = await resolveSessionPath(id);
-    if (!path) return null;
-    sm = openSessionManager(path);
-  }
-  const entries = sm.getEntries();
-  const lastEntryId = (entries[entries.length - 1] as { id?: string } | undefined)?.id;
-  const leafId = sm.getLeafId();
-  const cached = summaries.get(sm);
-  if (cached && cached.entryCount === entries.length && cached.lastEntryId === lastEntryId && cached.leafId === leafId) return cached.summary;
-
-  const ownEntries = sideOwnEntries(entries);
-  const stats = computeSessionStats(ownEntries as unknown as SessionEntry[]);
-  const summary: SessionUsageSummary = {
-    tokens: stats.tokens,
-    cost: stats.cost,
-    toolCalls: stats.toolCalls,
-    totalActiveMs: computeSessionTotalActiveMs(ownEntries as typeof entries),
-    ...getSessionSettings(entries as unknown as SessionEntry[], leafId),
-  };
-  summaries.set(sm, { entryCount: entries.length, lastEntryId, leafId, summary });
-  return summary;
 }
 
 // POST /api/sessions/stats - body { ids: string[] } (at most MAX_SESSION_STATS_IDS).
@@ -89,15 +34,10 @@ export async function POST(req: Request) {
   if (!Array.isArray(ids) || ids.length === 0) return refusal(400, "ids must be a non-empty array");
   if (ids.length > MAX_SESSION_STATS_IDS) return refusal(400, `ids may hold at most ${MAX_SESSION_STATS_IDS} session ids`);
   if (!ids.every((id) => typeof id === "string" && SESSION_ID_PATTERN.test(id))) return refusal(400, "ids must be session ids");
-
-  const stats: Record<string, SessionUsageSummary> = {};
-  for (const id of new Set(ids as string[])) {
-    try {
-      const summary = await readSummary(id);
-      if (summary) stats[id] = summary;
-    } catch {
-      // Malformed or concurrently removed session: leave it out.
-    }
+  const result = await sessions.stats({ ids: ids as string[] });
+  if (!result.ok) {
+    if (result.kind === "invalid") return NextResponse.json({ error: "Invalid session id", reason: result.reason }, { status: 400 });
+    return NextResponse.json({ error: "Codex sessions are not available", reason: "backend-unavailable" }, { status: 400 });
   }
-  return NextResponse.json({ stats }, { headers: NO_STORE });
+  return NextResponse.json(result.value, { headers: NO_STORE });
 }

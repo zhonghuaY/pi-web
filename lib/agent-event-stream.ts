@@ -9,6 +9,7 @@ import type { DebugEventStream } from "./debug-types";
 export interface AgentEventStreamSession {
   readonly isStreaming: boolean;
   readonly streamingMessage: unknown;
+  readonly turnSnapshot?: unknown;
   isAlive?(): boolean;
   onEvent(listener: (event: AgentEventLike) => void): () => void;
 }
@@ -168,7 +169,7 @@ function errorMessage(error: unknown): string {
  * stream for the debug panel.
  */
 export function createAgentEventStream(
-  req: Request,
+  req: Pick<Request, "signal">,
   sessionId: string,
   sessionPromise: Promise<AgentEventStreamSession>,
   meta?: { holder?: string | null; address?: string | null; client?: string | null },
@@ -327,6 +328,7 @@ export function createAgentEventStream(
             type: "connected",
             sessionId,
             isStreaming: session.isStreaming,
+            ...(session.turnSnapshot === undefined ? {} : { turnSnapshot: session.turnSnapshot }),
             // onEvent() has just replayed every request the session still holds,
             // so a reconnecting client can drop the ones closed while it was away.
             pendingAgentInteractionIds: bufferedEvents

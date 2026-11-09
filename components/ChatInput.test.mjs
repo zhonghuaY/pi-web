@@ -680,7 +680,7 @@ test("reads attached images unchanged, leaving resizing to pi", async () => {
 });
 
 test("Pi fixed slash commands are hidden for Claude while capability filtering still applies to Pi", () => {
-  const all = { fork: true, treeBranch: true, export: true, compact: true, mcp: true, side: true, steer: true, toolPresets: true, followUp: true };
+  const all = { fork: true, treeBranch: true, export: true, compact: true, mcp: true, side: true, steer: true, toolPresets: true, followUp: true, commands: true, models: true, setModel: true, effort: true, rename: true, delete: true };
   assert.deepEqual(getVisibleBuiltinSlashCommands("claude", all, false).map((command) => command.name), ["name", "session", "copy", "side"]);
   assert.deepEqual(getVisibleBuiltinSlashCommands("claude", all, true).map((command) => command.name), ["session", "copy", "side"]);
   const restricted = { ...all, compact: false, fork: false, side: false };
@@ -689,6 +689,9 @@ test("Pi fixed slash commands are hidden for Claude while capability filtering s
   assert.equal(names.includes("compact"), false);
   assert.equal(names.includes("clone"), false);
   assert.equal(names.includes("side"), false);
+  const codex = { ...all, side: false, rename: false, delete: false, commands: false };
+  assert.deepEqual(getVisibleBuiltinSlashCommands("codex", codex, false).map((command) => command.name), ["compact", "clone"]);
+  assert.deepEqual(getVisibleBuiltinSlashCommands("codex", codex, true).map((command) => command.name), []);
 });
 
 test("backend discovery errors are visible with a retry action", () => {
@@ -707,7 +710,7 @@ test("existing-session backend selector discloses handoff and locks while creati
   const html = renderToStaticMarkup(
     React.createElement(I18nProvider, null, React.createElement(ChatInput, {
       onSend() {}, onAbort() {}, onBackendChange() {}, isStreaming: false,
-      backend: "pi", backendHandoff: true, backendChanging: true,
+      backend: "pi", backendHandoff: true, backendChanging: true, handoffTargetBackend: "claude",
     })),
   );
   assert.ok(html.includes('title="Continue in another backend (creates a linked native session)"'));
@@ -716,13 +719,26 @@ test("existing-session backend selector discloses handoff and locks while creati
   assert.match(html, /<option value="claude" selected=""/);
 });
 
+test("existing-session backend selector exposes Codex and shows its real pending destination", () => {
+  const html = renderToStaticMarkup(
+    React.createElement(I18nProvider, null, React.createElement(ChatInput, {
+      onSend() {}, onAbort() {}, onBackendChange() {}, isStreaming: false,
+      backend: "pi", backendHandoff: true, backendChanging: true, handoffTargetBackend: "codex",
+      backends: { pi: { available: true }, claude: { available: true }, codex: { available: true } },
+    })),
+  );
+  assert.match(html, /<option value="pi" disabled=""/);
+  assert.match(html, /<option value="claude">Claude<\/option>/);
+  assert.match(html, /<option value="codex" selected="">Codex<\/option>/);
+});
+
 test("Claude composer exposes native model and effort selectors", () => {
   const html = renderToStaticMarkup(
     React.createElement(I18nProvider, null, React.createElement(ChatInput, {
       onSend() {}, onAbort() {}, isStreaming: false, backend: "claude",
       model: { provider: "claude", modelId: "sonnet" },
       modelList: [{ provider: "claude", id: "sonnet", name: "Sonnet", providerName: "Claude" }],
-      onModelChange() {}, thinkingLevel: "high", availableThinkingLevels: ["low", "medium", "high"], onThinkingLevelChange() {},
+      onModelChange() {}, reasoning: { label: "high", rows: [], disabled: false, busy: false, onChange() {} },
     })),
   );
   assert.match(html, /aria-label="Change model"/);
