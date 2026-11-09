@@ -2,7 +2,7 @@ import { realpath } from "node:fs/promises";
 import type { CodexEffectiveSettings } from "@/lib/agent-session-choices";
 import { codexWebSessionId } from "./identity";
 import { codexPayloadValidators } from "./internal/payloads";
-import { SUPPORTED_CODEX_CLI_VERSION } from "./internal/protocol";
+import { AUTONOMOUS_THREAD_PARAMS, SUPPORTED_CODEX_CLI_VERSION } from "./internal/protocol";
 import { CodexTransportError, startCodexTransport } from "./internal/transport";
 
 const inspection = codexPayloadValidators({ state: "supported", version: SUPPORTED_CODEX_CLI_VERSION });
@@ -14,7 +14,7 @@ const validators = inspection.validators;
 export async function forkCodexThread(input: { threadId: string; cwd: string; settings: CodexEffectiveSettings; onSent: () => void; options: Parameters<typeof startCodexTransport>[0] }) {
   const transport = await startCodexTransport({ ...input.options, cwd: input.cwd, shutdownTimeoutMs: 500 });
   try {
-    const params = { threadId: input.threadId, cwd: input.cwd, model: input.settings.model, modelProvider: input.settings.modelProvider,
+    const params = { threadId: input.threadId, cwd: input.cwd, ...AUTONOMOUS_THREAD_PARAMS, model: input.settings.model, modelProvider: input.settings.modelProvider,
       ...(input.settings.effort === null ? {} : { config: { model_reasoning_effort: input.settings.effort } }) };
     if (validators.validate("thread/fork:request", params).state !== "valid") throw new CodexTransportError("protocol");
     input.onSent();

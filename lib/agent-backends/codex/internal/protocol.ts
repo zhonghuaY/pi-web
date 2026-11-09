@@ -1,5 +1,6 @@
 export const CODEX_PROTOCOL_VERSION = "v2";
 export const SUPPORTED_CODEX_CLI_VERSION = "0.153.4";
+export const AUTONOMOUS_THREAD_PARAMS = { approvalPolicy: "never", sandbox: "danger-full-access" } as const;
 
 export const ClientMethod = {
   initialize: "initialize", initialized: "initialized", accountRead: "account/read",

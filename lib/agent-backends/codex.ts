@@ -5,7 +5,7 @@ import type { AgentMessage } from "@/lib/types";
 import { cwdMissingMessage } from "@/lib/missing-cwd";
 import { SESSION_IDLE_TIMEOUT_MS, type AgentEvent } from "@/lib/rpc-manager";
 import { codexPayloadValidators, type CodexPayloads, type CodexPayloadMethod } from "./codex/internal/payloads";
-import { ClientMethod, ServerRequestMethod, SUPPORTED_CODEX_CLI_VERSION, type RpcRequest } from "./codex/internal/protocol";
+import { AUTONOMOUS_THREAD_PARAMS, ClientMethod, ServerRequestMethod, SUPPORTED_CODEX_CLI_VERSION, type RpcRequest } from "./codex/internal/protocol";
 import type { AgentInteractionRequest } from "./types";
 import { CodexTransportError, startCodexTransport, type CodexTransport } from "./codex/internal/transport";
 import { runCodexMutationOnce } from "./codex/mutation-journal";
@@ -799,7 +799,7 @@ async function createCodexSessionImpl(input: CreateInput, options: ActorOptions 
   if (!parseCodexRequestId(input.requestId) || !isAbsolute(input.cwd) || normalize(input.cwd) !== input.cwd || (input.model !== undefined && (typeof input.model !== "string" || !input.model)) || (input.effort !== undefined && (!input.model || typeof input.effort !== "string" || !input.effort))) return fail(generic("invalid", "Invalid create request"));
   const directoryFailure = await projectDirectoryFailure(input.cwd);
   if (directoryFailure) return fail(directoryFailure);
-  const params = { cwd: input.cwd, ...(input.model !== undefined ? { model: input.model } : {}), ...(input.effort !== undefined ? { config: { model_reasoning_effort: input.effort } } : {}) };
+  const params = { cwd: input.cwd, ...AUTONOMOUS_THREAD_PARAMS, ...(input.model !== undefined ? { model: input.model } : {}), ...(input.effort !== undefined ? { config: { model_reasoning_effort: input.effort } } : {}) };
   try { validate("thread/start:request", params); } catch { return fail(generic("invalid", "Invalid create request")); }
   let transport: CodexTransport | undefined;
   const holder: { actor?: Actor } = {};
@@ -897,7 +897,7 @@ async function ensureCodexSessionImpl(id: WebId, options: ActorOptions = {}): Pr
       await transport.shutdown();
       transport = await startCodexTransport({ ...options, cwd: read.thread.cwd, interactionTimeoutMs: 86_400_000, serverRequests: interactionHandlers(() => actor), onNotification: raw => onNotification(() => actor, raw), onFailure: () => onTransportFailure(actor) });
       let resumed: CodexPayloads["thread/resume:response"];
-      try { resumed = validate("thread/resume:response", await transport.request(ClientMethod.threadResume, { threadId })); }
+      try { resumed = validate("thread/resume:response", await transport.request(ClientMethod.threadResume, { threadId, ...AUTONOMOUS_THREAD_PARAMS })); }
       catch (error) {
         if (error instanceof CodexTransportError && error.kind === "rpc" && error.code === -32600) return fail({ kind: "resume-refused", code: -32600, message: "Codex refused to resume the thread" });
         return fail(nativeFailure(error));
