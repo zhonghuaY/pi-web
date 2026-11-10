@@ -1,9 +1,7 @@
-import { readdirSync } from "fs";
-import { homedir } from "os";
-import path from "path";
 import { getAdditionalAllowedRoots, normalizeSlashes } from "./allowed-roots";
 import { isExistingPathWithinRoots, isPathWithinRoots } from "./path-security";
 import { listAllSessions } from "./session-reader";
+import { readClaudeCatalogue } from "./agent-catalog";
 export { allowFileRoot, normalizeSlashes } from "./allowed-roots";
 export { isWindowsAbsolutePath } from "./paths";
 
@@ -22,24 +20,14 @@ export async function getAllowedFileRoots(): Promise<Set<string>> {
   const cached = globalThis.__piAllowedRootsCache;
   if (cached && cached.expiresAt > now) return cached.roots;
 
-  const sessions = await listAllSessions();
+  const [piSessions, claude] = await Promise.all([listAllSessions(), readClaudeCatalogue()]);
+  const sessions = [...piSessions, ...claude.sessions];
   const roots = new Set<string>();
   for (const s of sessions) {
     if (s.cwd) roots.add(normalizeSlashes(s.cwd));
     // The project root (main repo shared by all worktrees) is browsable too —
     // the project dropdown lists it even when only worktrees have sessions.
     if (s.projectRoot) roots.add(normalizeSlashes(s.projectRoot));
-  }
-
-  // Also allow ~/pi-cwd-* directories created by the default-cwd endpoint.
-  try {
-    for (const name of readdirSync(homedir())) {
-      if (/^pi-cwd-\d{8}$/.test(name)) {
-        roots.add(normalizeSlashes(path.join(homedir(), name)));
-      }
-    }
-  } catch {
-    // ignore if home is unreadable
   }
 
   for (const root of getAdditionalAllowedRoots()) roots.add(root);

@@ -1,51 +1,14 @@
 import { NextResponse } from "next/server";
-import { getSessionEntries, resolveSessionPath } from "@/lib/session-reader";
-import { MAX_TOOL_RESULT_IMAGE_BYTES, TOOL_RESULT_IMAGE_MIMES } from "@/lib/tool-result-images";
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function readBase64Image(block: unknown): { data: string; mime: string } | null {
-  if (!isRecord(block) || block.type !== "image") return null;
-
-  if (typeof block.data === "string" && typeof block.mimeType === "string") {
-    return { data: block.data, mime: block.mimeType };
-  }
-
-  if (
-    isRecord(block.source) &&
-    block.source.type === "base64" &&
-    typeof block.source.data === "string" &&
-    typeof block.source.media_type === "string"
-  ) {
-    return { data: block.source.data, mime: block.source.media_type };
-  }
-
-  return null;
-}
-
-function decodeBoundedBase64(data: string): Uint8Array | null {
-  // Reject malformed and obviously oversized payloads before allocating.
-  if (
-    data.length === 0 ||
-    data.length > Math.ceil(MAX_TOOL_RESULT_IMAGE_BYTES * 4 / 3) + 4 ||
-    data.length % 4 !== 0 ||
-    !/^[A-Za-z0-9+/]*={0,2}$/.test(data)
-  ) {
-    return null;
-  }
-
-  const bytes = Buffer.from(data, "base64");
-  if (bytes.length === 0 || bytes.length > MAX_TOOL_RESULT_IMAGE_BYTES) return null;
-  return new Uint8Array(bytes);
-}
+import { sessions } from "@/lib/backend-service";
+import { sessionRouteRefusal } from "@/lib/session-route-identity";
 
 export async function GET(
   req: Request,
   { params }: { params: Promise<{ id: string; entryId: string }> },
 ) {
   const { id, entryId } = await params;
+  const refusal = sessionRouteRefusal(id);
+  if (refusal) return refusal;
   const blockIndexParam = new URL(req.url).searchParams.get("blockIndex");
   const blockIndex = blockIndexParam === null ? Number.NaN : Number(blockIndexParam);
   if (!Number.isSafeInteger(blockIndex) || blockIndex < 0) {
@@ -53,30 +16,28 @@ export async function GET(
   }
 
   try {
-    const filePath = await resolveSessionPath(id);
-    if (!filePath) return NextResponse.json({ error: "Session not found" }, { status: 404 });
-
-    const entry = getSessionEntries(filePath).find((candidate) => candidate.id === entryId);
-    if (!entry || entry.type !== "message" || entry.message.role !== "toolResult") {
-      return NextResponse.json({ error: "Tool result not found" }, { status: 404 });
+    const result = await sessions.toolResultImage({ id, entryId, blockIndex });
+    if (!result.ok) {
+      if (result.kind === "invalid" || result.kind === "unsupported") return sessionRouteRefusal(id)!;
+      const error = result.kind === "not-found" ? "Session not found"
+        : result.kind === "entry-not-found" ? "Tool result not found"
+        : result.kind === "block-not-found" ? "Tool result image not found"
+        : result.kind === "unsupported-mime" ? "Unsupported image type" : "Invalid or oversized image data";
+      const status = result.kind === "unsupported-mime" ? 415 : result.kind === "invalid-image" ? 413 : 404;
+      return NextResponse.json({ error }, { status });
     }
-
-    const image = readBase64Image(entry.message.content[blockIndex]);
-    if (!image) return NextResponse.json({ error: "Tool result image not found" }, { status: 404 });
-    if (!TOOL_RESULT_IMAGE_MIMES.has(image.mime)) {
-      return NextResponse.json({ error: "Unsupported image type" }, { status: 415 });
-    }
-
-    const bytes = decodeBoundedBase64(image.data);
-    if (!bytes) return NextResponse.json({ error: "Invalid or oversized image data" }, { status: 413 });
-
+    const { mime, bytes } = result.value;
     const body = new ArrayBuffer(bytes.byteLength);
     new Uint8Array(body).set(bytes);
     return new Response(body, {
       headers: {
-        "Content-Type": image.mime,
+        "Content-Type": mime,
         "Content-Length": String(bytes.byteLength),
-        "Cache-Control": "private, no-cache",
+        // A session's entry id and block index name these bytes for good: pi
+        // only appends, a migration's rewrite keeps every entry, and a context
+        // edit leaves raw history alone. Revalidating re-sent multi-MB images
+        // and decoded their base64 again on each view.
+        "Cache-Control": "private, max-age=31536000, immutable",
         "X-Content-Type-Options": "nosniff",
       },
     });

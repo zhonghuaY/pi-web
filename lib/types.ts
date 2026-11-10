@@ -1,5 +1,8 @@
 // Types mirrored from pi-mono coding-agent session-manager
 
+import type { AgentCapabilities } from "@/lib/agent-backends";
+import type { BackendId } from "@/lib/session-identity";
+
 export interface SessionHeader {
   type: "session";
   version?: number;
@@ -34,7 +37,7 @@ export interface ImageContent {
 export interface ThinkingContent {
   type: "thinking";
   thinking: string;
-  /** Historical content omitted from the initial response and loaded on demand. */
+  /** Historical content is a short preview; full reasoning is loaded on demand. */
   deferred?: boolean;
 }
 
@@ -76,7 +79,10 @@ export interface AssistantMessage {
   provider: string;
   stopReason?: string;
   errorMessage?: string;
+  /** When the request started. */
   timestamp?: number;
+  /** From `timestamp` until the response ended, measured by pi (pi 1.1); absent for older messages. */
+  durationMs?: number;
   usage?: AgentUsage;
 }
 
@@ -88,6 +94,8 @@ export interface ToolResultMessage {
   isError?: boolean;
   details?: unknown;
   timestamp?: number;
+  /** How long the tool ran, measured by pi with a monotonic clock (pi 1.1); absent for older results. */
+  durationMs?: number;
   usage?: AgentUsage;
 }
 
@@ -104,6 +112,7 @@ export interface BashExecutionMessage {
   role: "bashExecution";
   command: string;
   output: string;
+  codexStatus?: "inProgress" | "completed" | "failed" | "declined";
   exitCode?: number;
   cancelled?: boolean;
   truncated?: boolean;
@@ -113,6 +122,23 @@ export interface BashExecutionMessage {
 }
 
 export type AgentMessage = UserMessage | AssistantMessage | ToolResultMessage | CustomMessage | BashExecutionMessage;
+
+/**
+ * Prompt and tool loadout carried by the session transcript (Pi >= 0.86). The
+ * leading one holds the base prompt; later ones patch `sections` by name and
+ * list tool changes. Never a chat message: the UI hides it everywhere.
+ */
+export interface SystemMessage {
+  role: "system";
+  content: string | TextContent[];
+  sections?: Record<string, string | null>;
+  toolsAdded?: unknown[];
+  toolsRemoved?: Array<{ name: string }>;
+  timestamp?: number;
+}
+
+/** Any message a `message` entry can store, including transcript system messages. */
+export type SessionMessage = AgentMessage | SystemMessage;
 
 export type ExtensionUiRequest =
   | {
@@ -216,7 +242,7 @@ export interface ExtensionWidgetItem {
 
 export interface SessionMessageEntry extends SessionEntryBase {
   type: "message";
-  message: AgentMessage;
+  message: SessionMessage;
 }
 
 export interface ThinkingLevelChangeEntry extends SessionEntryBase {
@@ -228,6 +254,16 @@ export interface ModelChangeEntry extends SessionEntryBase {
   type: "model_change";
   provider: string;
   modelId: string;
+}
+
+/** Model usage outside the conversation, such as prompt-cache warming (`kind: "cache_warm"`). */
+export interface UsageEntry extends SessionEntryBase {
+  type: "usage";
+  kind: string;
+  provider: string;
+  model: string;
+  usage: AgentUsage;
+  note?: string;
 }
 
 export interface CompactionEntry extends SessionEntryBase {
@@ -274,14 +310,27 @@ export interface SessionInfoEntry extends SessionEntryBase {
   name?: string;
 }
 
+/**
+ * Append-only edit of an earlier entry's model context. Raw history, usage
+ * and the UI are unaffected: `replacement: null` omits the target from future
+ * provider requests, a value replaces only its content.
+ */
+export interface ContextEditEntry extends SessionEntryBase {
+  type: "context_edit";
+  targetId: string;
+  replacement: { content: unknown } | null;
+}
+
 export type SessionEntry =
   | SessionMessageEntry
   | ThinkingLevelChangeEntry
   | ModelChangeEntry
+  | UsageEntry
   | CompactionEntry
   | BranchSummaryEntry
   | CustomEntry
   | CustomMessageEntry
+  | ContextEditEntry
   | LabelEntry
   | SessionInfoEntry;
 
@@ -294,6 +343,7 @@ export interface BranchPreview {
 
 export type SubagentSessionStatus =
   | "starting"
+  | "queued"
   | "running"
   | "completed"
   | "failed"
@@ -309,6 +359,10 @@ export interface SessionTreeNode {
 }
 
 export interface SessionInfo {
+  /** Missing on historical Pi sessions for compatibility. */
+  backend?: BackendId;
+  /** Missing Pi capabilities preserve the existing full Pi feature set. */
+  capabilities?: AgentCapabilities;
   path: string;
   id: string;
   cwd: string;
@@ -317,9 +371,11 @@ export interface SessionInfo {
   modified: string;
   messageCount: number;
   firstMessage: string;
-  parentSessionId?: string; // source session for a fork, or parent session for a subagent
-  /** How this session relates to another session. Forks remain top-level in the
-   *  UI; only subagent relations form a visible parent/child tree. */
+  /** True while the sidebar has only header/stat metadata for this session. */
+  detailsPending?: boolean;
+  parentSessionId?: string; // source session for a fork, or parent session for a subagent or side chat
+  /** How this session relates to another session. Forks and handoffs remain
+   *  top-level in the UI; subagent and side relations form a parent/child tree. */
   relation?:
     | { kind: "fork"; originSessionId?: string }
     | {
@@ -328,6 +384,14 @@ export interface SessionInfo {
         profile: string;
         description: string;
         status: SubagentSessionStatus;
+      }
+    | { kind: "side"; parentSessionId: string }
+    | {
+        kind: "handoff";
+        sourceSessionId: string;
+        sourceBackend: BackendId;
+        sourceEntryId?: string;
+        requestId: string;
       };
   /** Main repo root shared by all worktrees of this cwd (cwd itself for non-git dirs).
    *  Always set by the server; optional because the client builds transient
@@ -351,6 +415,8 @@ export interface SessionContext {
   entryIds: string[]; // parallel to messages — the session entry id for each message
   oldestEntryId: string | null;
   hasMore: boolean;
+  /** Turns on the branch before `oldestEntryId`, not loaded (the minimap numbers from it). */
+  turnsBefore: number;
   thinkingLevel: string;
   model: { provider: string; modelId: string } | null;
 }

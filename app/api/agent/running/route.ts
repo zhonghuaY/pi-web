@@ -1,18 +1,13 @@
 import { NextResponse } from "next/server";
-import {
-  getCompletionNotificationSuppressedRpcSessionIds,
-  getRunningRpcSessionIds,
-} from "@/lib/rpc-manager";
+import { sessions } from "@/lib/backend-service";
 
 export const dynamic = "force-dynamic";
 
 // GET /api/agent/running - Lightweight snapshot for visible-tab polling.
+// sessionUiStateRevision (null when unreadable) tells the sidebar its pins and
+// archive changed elsewhere; it costs one stat while the file is unchanged.
+// subagentsActiveSessionIds: sessions whose subagents can still start a run
+// there, so the sidebar announces their completion only after the last one.
 export async function GET() {
-  return NextResponse.json(
-    {
-      runningSessionIds: getRunningRpcSessionIds(),
-      completionNotificationSuppressedSessionIds: getCompletionNotificationSuppressedRpcSessionIds(),
-    },
-    { headers: { "Cache-Control": "no-store" } },
-  );
+  return NextResponse.json(await sessions.running(), { headers: { "Cache-Control": "no-store" } });
 }

@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { existsSync } from "fs";
-import { addWorktree, findCurrentWorktreePath, listWorktrees, removeWorktree, resolveProject } from "@/lib/worktree";
+import { addWorktree, findCurrentWorktreePath, listWorktrees, removeWorktree, resolveProject, WorktreeBranchInUseError, worktreeRemovalRequiresForce } from "@/lib/worktree";
 import { allowFileRoot, getAllowedFileRoots, isExistingFilePathAllowed, isFilePathAllowed } from "@/lib/file-access";
 import { projectIdentityKey } from "@/lib/project-identity";
 
@@ -54,6 +54,8 @@ export async function GET(req: Request) {
 }
 
 // POST /api/worktrees  body: { cwd, branch }  →  { path, branch }
+//   409 { code: "branch_in_use", branch, worktreePath } when another worktree has the branch,
+//   code "branch_worktree_missing" when that worktree's folder is gone (git worktree prune clears it)
 export async function POST(req: Request) {
   try {
     const body = await req.json() as { cwd?: string; branch?: string };
@@ -73,6 +75,17 @@ export async function POST(req: Request) {
     return NextResponse.json(result);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    if (error instanceof WorktreeBranchInUseError) {
+      return NextResponse.json(
+        {
+          error: message,
+          code: error.missing ? "branch_worktree_missing" : "branch_in_use",
+          branch: error.branch,
+          worktreePath: error.worktreePath,
+        },
+        { status: 409 },
+      );
+    }
     return NextResponse.json({ error: message }, { status: 400 });
   }
 }
@@ -94,9 +107,9 @@ export async function DELETE(req: Request) {
     return NextResponse.json({ success: true });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    // git refuses to remove dirty worktrees without --force; surface that so
-    // the UI can offer a force-remove confirmation.
-    const dirty = /contains modified or untracked files|is dirty/i.test(message);
+    // Git refuses some worktree removals without --force, including worktrees
+    // with submodule state. Surface that so the UI can offer confirmation.
+    const dirty = worktreeRemovalRequiresForce(message);
     return NextResponse.json({ error: message, dirty }, { status: dirty ? 409 : 400 });
   }
 }

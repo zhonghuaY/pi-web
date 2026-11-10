@@ -1,9 +1,13 @@
 "use client";
 
-import React, { useRef, useState, useCallback, useEffect, useLayoutEffect, useImperativeHandle, forwardRef, KeyboardEvent } from "react";
+import type { ReasoningControl } from "@/lib/agent-session-choices";
+
+import React, { memo, useRef, useState, useCallback, useEffect, useLayoutEffect, useImperativeHandle, forwardRef, KeyboardEvent } from "react";
 import type { BuiltinSlashCommandResult, CompactResultInfo, QueuedMessages, SlashCommandInfo } from "@/hooks/useAgentSession";
 import type { SkillsResponse } from "@/lib/api-types";
 import type { TextContent, UserMessage } from "@/lib/types";
+import { shouldHandleWebSlashCommand, type AgentBackend, type AgentBackends, type AgentCapabilities } from "@/lib/agent-backends";
+import { isHandoffEdge } from "@/lib/session-identity";
 import {
   clearDraft,
   getDraft,
@@ -22,10 +26,19 @@ import {
   buildEntriesFromFiles, buildAtInsertText, extractAtQuery, filterFileEntries,
   type AtQueryMatch, type FileIndexEntry,
 } from "@/lib/file-fuzzy";
+import { getMarkdownListContinuation } from "@/lib/markdown-list-continuation";
+import { quoteSeparator } from "@/lib/quoted-selection";
+import { isBareMcpCommand, isBuiltinMcpCommand } from "@/lib/mcp-command";
 import { FolderIcon, getFileIcon } from "./FileIcons";
+import { ImagePreview } from "./ImagePreview";
+import { DismissButton } from "./DismissButton";
 import { useIsMobile } from "@/hooks/useIsMobile";
+import { useEnterSendMode } from "@/hooks/useEnterSendMode";
 import { useI18n } from "@/hooks/useI18n";
+import { useChatAppearance } from "@/hooks/useChatAppearance";
+import { useFontPreferences } from "@/hooks/useFontPreferences";
 import type { ToolPreset } from "@/lib/tool-presets";
+import { SelectorRow } from "./SelectorRow";
 import { ModelSelector, type ModelSelectorOption } from "./ModelSelector";
 
 export { filterModelOptions } from "./ModelSelector";
@@ -40,29 +53,55 @@ interface Props {
   onSend: (message: string, images?: AttachedImage[]) => void;
   onAbort: () => void;
   onSteer?: (message: string, images?: AttachedImage[]) => void;
+  /** Sends the draft to a new side chat instead of the running agent. */
+  onSideChat?: (message: string) => void;
   onFollowUp?: (message: string, images?: AttachedImage[]) => void;
   onPromptWithStreamingBehavior?: (message: string, behavior: "steer" | "followUp", images?: AttachedImage[]) => void;
   isStreaming: boolean;
+  backend?: AgentBackend;
+  backends?: AgentBackends;
+  backendsLoading?: boolean;
+  backendsError?: string | null;
+  onRetryBackends?: () => void;
+  capabilities?: AgentCapabilities;
+  onBackendChange?: (backend: AgentBackend) => void;
+  /** An existing session creates a linked native session when this changes. */
+  backendHandoff?: boolean;
+  backendChanging?: boolean;
+  handoffTargetBackend?: AgentBackend | null;
+  effectiveNativeModel?: string | null;
+  shellCommandsEnabled?: boolean;
+  /** Text-only composer without the session controls or outer spacing. */
+  compact?: boolean;
   model?: { provider: string; modelId: string } | null;
   isAutoModelSelection?: boolean;
   modelNames?: Record<string, string>;
-  modelList?: { id: string; name: string; provider: string }[];
+  modelList?: { id: string; name: string; provider: string; providerName?: string; input?: string[] }[];
   modelError?: string | null;
+  /** The session's folder, when it no longer exists (moved or renamed): said instead of a model error (#1422). */
+  missingCwd?: string | null;
   /** Diagnostics from resolving `enabledModels`, e.g. a pattern that matched nothing. */
   modelScopeWarnings?: string[];
+  /** Every available model, once loaded for the selector's "all" scope. */
+  allModelList?: { id: string; name: string; provider: string; providerName?: string }[] | null;
+  /** Set only while `enabledModels` narrows the list: loads `allModelList`. */
+  onLoadAllModels?: () => void;
+  onLoadModels?: () => void | Promise<void>;
   onModelChange?: (provider: string, modelId: string) => void;
   modelSwitching?: boolean;
+  /** The model new sessions start with, starred in the model selector. */
+  defaultModel?: { provider: string; modelId: string } | null;
+  /** Saves a model as the default for new sessions and selects it here. */
+  onSetDefaultModel?: (provider: string, modelId: string) => void;
   onCompact?: () => void;
   onAbortCompaction?: () => void;
   isCompacting?: boolean;
   compactError?: string | null;
+  onDismissCompactError?: () => void;
   compactResult?: CompactResultInfo | null;
   toolPreset?: ToolPreset;
   onToolPresetChange?: (preset: ToolPreset) => void;
-  thinkingLevel?: "auto" | "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
-  onThinkingLevelChange?: (level: "auto" | "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max") => void;
-  availableThinkingLevels?: string[] | null;
-  thinkingLevelMap?: Record<string, string | null> | null;
+  reasoning?: ReasoningControl | null;
   retryInfo?: { attempt: number; maxAttempts: number; errorMessage?: string } | null;
   queuedMessages?: QueuedMessages | null;
   inputHistory?: string[];
@@ -77,21 +116,28 @@ interface Props {
   draftKey?: string;
   /** Session working directory — enables the @ file autocomplete menu */
   cwd?: string | null;
+  /** Files picked with the attach button, handled like files dropped onto the chat. Without it the button takes images only. */
+  onAttachFiles?: (files: File[]) => void;
 }
 
 export interface ChatInputHandle {
   insertText: (text: string) => void;
+  /** Insert at the caret as a paragraph of its own: a blockquote must start a line. */
+  insertQuote: (text: string) => void;
   insertIfEmpty: (text: string) => void;
   replaceMessage: (message: UserMessage) => void;
   prependText: (text: string) => void;
   addImages: (files: File[]) => void;
   rekeyDraft: (previousKey: string, nextKey: string) => void;
   restoreSubmission: (text: string, images?: ChatDraftImage[], targetDraftKey?: string) => void;
+  focus: () => void;
 }
 
-const TOOL_PRESETS = ["chat-only", "read-only", "default", "full"] as const;
+// "configured" sends no override, so the session follows settings.json defaultTools.
+const TOOL_PRESETS = ["configured", "chat-only", "read-only", "default", "full"] as const;
 type ToolPresetLabel = typeof TOOL_PRESETS[number];
 const TOOL_PRESET_MAP: Record<ToolPresetLabel, ToolPreset> = {
+  configured: "configured",
   "chat-only": "none",
   "read-only": "read-only",
   default: "default",
@@ -103,6 +149,97 @@ const ANCHORED_MENU_GAP = 8;
 
 export function getUpwardMenuMaxHeight(menuBottom: number, visibleTop: number, gap = ANCHORED_MENU_GAP): number {
   return Math.max(0, Math.floor(menuBottom - visibleTop - gap));
+}
+
+export function cycleListIndex(index: number, length: number, delta: number): number {
+  if (length <= 0) return 0;
+  return ((index + delta) % length + length) % length;
+}
+
+// Plain replacement for when execCommand is unavailable or refuses: no undo
+// entry, but the mention still lands and React's onChange still fires.
+function setTextareaRange(textarea: HTMLTextAreaElement, start: number, end: number, text: string): void {
+  textarea.setRangeText(text, start, end, "end");
+  textarea.dispatchEvent(new Event("input", { bubbles: true }));
+}
+
+// Replace [start, end) with `text` as native edits so the textarea's own
+// undo/redo history records them. With a collapsed caret inside the range the
+// typed prefix is deleted and the tail forward-deleted, so undo returns to
+// what the user had typed.
+export function replaceTextareaRange(
+  textarea: HTMLTextAreaElement,
+  start: number,
+  end: number,
+  text: string,
+  cursorOffset = text.length,
+): void {
+  const selectionStart = textarea.selectionStart;
+  const selectionEnd = textarea.selectionEnd;
+  textarea.focus();
+
+  if (selectionStart === selectionEnd && start <= selectionStart && end >= selectionEnd) {
+    const finalLength = textarea.value.length - (end - start) + text.length;
+    for (let edits = selectionStart - start; edits > 0 && textarea.selectionStart > start; edits--) {
+      if (!document.execCommand("delete")) break;
+    }
+    if (document.execCommand("insertText", false, text)) {
+      for (let edits = end - selectionEnd; edits > 0 && textarea.value.length > finalLength; edits--) {
+        if (!document.execCommand("forwardDelete")) break;
+      }
+    } else {
+      // Whatever prefix the deletes left is still in [start, caret); the tail is untouched.
+      setTextareaRange(textarea, start, textarea.selectionStart + (end - selectionEnd), text);
+    }
+  } else {
+    textarea.setSelectionRange(start, end);
+    if (!document.execCommand("insertText", false, text)) setTextareaRange(textarea, start, end, text);
+  }
+
+  if (cursorOffset !== text.length) {
+    textarea.setSelectionRange(start + cursorOffset, start + cursorOffset);
+  }
+}
+
+export function replaceLinksWithMarkdown(
+  text: string,
+  links: Iterable<{ label: string; href: string; occurrence: number }>,
+): string | null {
+  let result = "";
+  let searchFrom = 0;
+  let replaced = false;
+
+  for (const { label, href, occurrence } of links) {
+    if (!label || !href) continue;
+    let index = 0;
+    for (let match = 0; match <= occurrence; match++) {
+      index = text.indexOf(label, match ? index + label.length : 0);
+      if (index < 0) break;
+    }
+    if (index < searchFrom) continue;
+    const escapedLabel = label.replace(/([\\[\]])/g, "\\$1");
+    const escapedHref = href.replace(/([\\()])/g, "\\$1");
+    result += `${text.slice(searchFrom, index)}[${escapedLabel}](${escapedHref})`;
+    searchFrom = index + label.length;
+    replaced = true;
+  }
+
+  return replaced ? result + text.slice(searchFrom) : null;
+}
+
+/**
+ * The composer's auto-grow step: fit the text to 200 px, then let a scrollbar
+ * appear only when the text is still taller than the box.
+ *
+ * The height comes from the value, not from scrollHeight: a wrapped
+ * placeholder counts toward scrollHeight too, so an empty box would grow to
+ * its own hint's lines. Only typed text scrolls, so a placeholder that
+ * overflows the box stays cut off instead of showing a scrollbar.
+ */
+export function autoGrowTextarea(ta: HTMLTextAreaElement): void {
+  ta.style.height = "auto";
+  ta.style.height = `${ta.value ? Math.min(ta.scrollHeight, 200) : ta.clientHeight}px`;
+  ta.style.overflowY = ta.value && ta.scrollHeight > ta.clientHeight ? "auto" : "hidden";
 }
 
 function getVisibleTopBoundary(element: HTMLElement): number {
@@ -118,11 +255,46 @@ function getVisibleTopBoundary(element: HTMLElement): number {
   return visibleTop;
 }
 
-const THINKING_LEVELS = ["auto", "off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
-const THINKING_LEVEL_DESC_KEYS: Record<typeof THINKING_LEVELS[number], string> = {
-  auto: "chat.thinkingUseDefault", off: "chat.thinkingOff", minimal: "chat.thinkingMinimal", low: "chat.thinkingLow",
-  medium: "chat.thinkingMedium", high: "chat.thinkingHigh", xhigh: "chat.thinkingXhigh", max: "chat.thinkingMax",
-};
+function subscribeUpwardMenuMaxHeight(
+  menu: HTMLElement,
+  onChange: (height: number) => void,
+): () => void {
+  let frameId: number | null = null;
+  const update = () => {
+    frameId = null;
+    onChange(getUpwardMenuMaxHeight(
+      menu.getBoundingClientRect().bottom,
+      getVisibleTopBoundary(menu),
+    ));
+  };
+  const scheduleUpdate = () => {
+    if (frameId !== null) cancelAnimationFrame(frameId);
+    frameId = requestAnimationFrame(update);
+  };
+
+  update();
+  const parent = menu.parentElement;
+  const layoutContainer = parent?.parentElement;
+  const anchorObserver = typeof ResizeObserver === "undefined" || !parent
+    ? null
+    : new ResizeObserver(scheduleUpdate);
+  if (parent) anchorObserver?.observe(parent);
+  if (layoutContainer) anchorObserver?.observe(layoutContainer);
+  const viewport = window.visualViewport;
+  viewport?.addEventListener("resize", scheduleUpdate);
+  viewport?.addEventListener("scroll", scheduleUpdate);
+  window.addEventListener("resize", scheduleUpdate);
+  window.addEventListener("scroll", scheduleUpdate, true);
+
+  return () => {
+    anchorObserver?.disconnect();
+    viewport?.removeEventListener("resize", scheduleUpdate);
+    viewport?.removeEventListener("scroll", scheduleUpdate);
+    window.removeEventListener("resize", scheduleUpdate);
+    window.removeEventListener("scroll", scheduleUpdate, true);
+    if (frameId !== null) cancelAnimationFrame(frameId);
+  };
+}
 
 function formatTokenCount(tokens: number): string {
   if (tokens >= 1_000_000) return `${(tokens / 1_000_000).toFixed(1)}M`;
@@ -143,12 +315,36 @@ type SlashCommandSource = SlashCommandPaletteItem["source"];
 
 const BUILTIN_SLASH_COMMANDS: BuiltinSlashCommand[] = [
   { name: "compact", description: "chat.commandCompact", source: "builtin" },
+  { name: "auto-compact", description: "chat.commandAutoCompact", source: "builtin" },
   { name: "reload", description: "chat.commandReload", source: "builtin" },
   { name: "name", description: "chat.commandName", source: "builtin" },
   { name: "session", description: "chat.commandSession", source: "builtin", availableWhileStreaming: true },
   { name: "copy", description: "chat.commandCopy", source: "builtin", availableWhileStreaming: true },
   { name: "clone", description: "chat.commandClone", source: "builtin" },
+  // A side chat forks the session while it runs (ADR 0007): the primary use
+  // case is a side question during a long parent run, so it must be offered
+  // mid-stream. The fork is file-level, never touching the running agent.
+  { name: "side", description: "chat.commandSide", source: "builtin", availableWhileStreaming: true },
 ];
+
+export function getVisibleBuiltinSlashCommands(
+  backend: AgentBackend,
+  capabilities: AgentCapabilities | undefined,
+  streaming: boolean,
+): BuiltinSlashCommand[] {
+  const commands = streaming
+    ? BUILTIN_SLASH_COMMANDS.filter((command) => command.availableWhileStreaming)
+    : BUILTIN_SLASH_COMMANDS;
+  return commands.filter((command) => {
+    if (backend === "codex" && command.name === "auto-compact") return false;
+    if (!shouldHandleWebSlashCommand(backend, command.name)) return false;
+    if (!capabilities) return true;
+    if (command.name === "compact" || command.name === "auto-compact") return capabilities.compact;
+    if (command.name === "clone") return capabilities.fork;
+    if (command.name === "side") return capabilities.side;
+    return true;
+  });
+}
 
 function getBuiltinSlashCommand(message: string): BuiltinSlashCommand | undefined {
   const match = message.trim().match(/^\/([^\s]+)(?:\s|$)/);
@@ -160,12 +356,60 @@ export function canRunBuiltinSlashCommandWhileStreaming(message: string): boolea
   return getBuiltinSlashCommand(message)?.availableWhileStreaming === true;
 }
 
+/**
+ * Whether a message sent while a run streams goes to the built-in handler
+ * first: a built-in that may run then, or a bare `/mcp`, which opens
+ * Settings › MCP when pi's built-in MCP extension owns it (useAgentSession)
+ * and is otherwise sent as before.
+ */
+export function offersBuiltinSlashCommandWhileStreaming(message: string): boolean {
+  return canRunBuiltinSlashCommandWhileStreaming(message) || isBareMcpCommand(message);
+}
+
 export function isExactSlashCommand(message: string, command: SlashCommandPaletteItem): boolean {
   return command.source === "builtin" && message.trim() === `/${command.name}`;
 }
 
+/**
+ * Whether Enter on the highlighted palette entry submits the message rather
+ * than completing it to "/name ": a built-in typed in full (while a run
+ * streams, only one that may run then), or a bare `/mcp` on pi's built-in
+ * `/mcp`, which opens Settings › MCP at once, as it does before the command
+ * list has loaded. Every other extension command still takes a second Enter.
+ */
+export function submitsSlashCommandOnEnter(message: string, command: SlashCommandPaletteItem, isStreaming: boolean): boolean {
+  if (command.source === "builtin") {
+    return isExactSlashCommand(message, command) && (!isStreaming || command.availableWhileStreaming === true);
+  }
+  return isBuiltinMcpCommand(command) && isBareMcpCommand(message);
+}
+
+export const RUN_END_CLICK_GUARD_MS = 600;
+
+/**
+ * When a run ends, Compact (and the tools button) take the place Stop held in
+ * the controls row, so the second click of a double click on Stop, or a click
+ * aimed at Stop just as the run ends, lands on them. Such a pointer click is
+ * ignored; a keyboard one (Enter/Space, `detail` 0) never is.
+ */
+export function isRunEndStrayClick(detail: number, msSinceRunEnd: number): boolean {
+  return detail > 0 && msSinceRunEnd < RUN_END_CLICK_GUARD_MS;
+}
+
 export function canClearBuiltinCommandInput(message: string, imageCount: number, submittedMessage: string): boolean {
   return imageCount === 0 && message.trim() === submittedMessage;
+}
+
+/**
+ * Whether the composer box stacks its draft above its buttons instead of sitting
+ * them side by side. A phone has no room for the steer and follow-up buttons next
+ * to the draft: in one row the two of them take more than half the width and the
+ * placeholder is cut to "立即引导 / 排队后...". So while a run streams they move to
+ * their own right-aligned row below the draft. Quote mode (`compact`) stacks for
+ * its own reason: it is a short excerpt, not a full composer.
+ */
+export function stacksComposerLayout(compact: boolean, isMobile: boolean, isStreaming: boolean): boolean {
+  return compact || (isMobile && isStreaming);
 }
 
 const SLASH_SOURCES: SlashCommandSource[] = ["builtin", "extension", "prompt", "skill"];
@@ -184,18 +428,42 @@ const SLASH_SOURCE_ORDER: Record<SlashCommandSource, number> = {
   skill: 3,
 };
 
-function slashMatchRank(command: SlashCommandPaletteItem, query: string, t: (key: string) => string): number {
+// pi's TUI matches a skill by its bare name (pi-tui's
+// CombinedAutocompleteProvider), so `/copy` finds `skill:copy-text` by prefix;
+// the full `skill:<name>` still matches a query that spells the prefix.
+function slashMatchRank(command: SlashCommandPaletteItem, query: string): number {
   const name = command.name.toLowerCase();
-  const description = getSlashDescription(command, t).toLowerCase();
-  if (name === query) return 0;
-  if (name.startsWith(query)) return 1;
+  const bareName = command.source === "skill" && name.startsWith("skill:") ? name.slice("skill:".length) : name;
+  if (bareName === query || name === query) return 0;
+  if (bareName.startsWith(query) || name.startsWith(query)) return 1;
   if (name.includes(query)) return 2;
-  if (description.includes(query)) return 3;
-  return 4;
+  return 3;
 }
 
 function getSlashDescription(command: SlashCommandPaletteItem, t: (key: string) => string): string {
   return command.source === "builtin" ? t(command.description) : command.description ?? "";
+}
+
+/**
+ * The palette's matches for a lower-cased query. pi's TUI matches names only;
+ * the palette searches descriptions too, but only when no name matches, so
+ * `/copy` lists the built-in, not every skill whose description says "copy".
+ */
+export function filterSlashCommands(
+  commands: SlashCommandPaletteItem[],
+  query: string,
+  t: (key: string) => string,
+): SlashCommandPaletteItem[] {
+  const ranked = commands.map((command) => ({ command, rank: slashMatchRank(command, query) }));
+  const byName = ranked.filter(({ rank }) => rank < 3);
+  const matches = byName.length > 0
+    ? byName
+    : ranked.filter(({ command }) => getSlashDescription(command, t).toLowerCase().includes(query));
+  return matches
+    .sort((a, b) => a.rank - b.rank
+      || SLASH_SOURCE_ORDER[a.command.source] - SLASH_SOURCE_ORDER[b.command.source]
+      || TEXT_COLLATOR.compare(a.command.name, b.command.name))
+    .map(({ command }) => command);
 }
 
 // Skill slash commands are named "skill:<skillName>"; look the skill up in the
@@ -208,12 +476,13 @@ function isDormantSkillCommand(command: SlashCommandPaletteItem, dormancy: Recor
 export function buildSlashCommandLayout(
   commands: SlashCommandPaletteItem[],
   dormancy: Record<string, boolean>,
+  query = "",
 ) {
   let index = 0;
   const groups = SLASH_SOURCES
     .map((source) => {
       const sourceCommands = commands.filter((command) => command.source === source);
-      const orderedCommands = source === "skill"
+      const orderedCommands = source === "skill" && !query
         ? [
             ...sourceCommands.filter((command) => !isDormantSkillCommand(command, dormancy)),
             ...sourceCommands.filter((command) => isDormantSkillCommand(command, dormancy)),
@@ -232,15 +501,9 @@ export function buildSlashCommandLayout(
   };
 }
 
-const CLIENT_IMAGE_COMPRESSION_THRESHOLD_BYTES = 1024 * 1024;
-const CLIENT_MAX_IMAGE_SIDE = 1024;
-const CLIENT_JPEG_QUALITY = 0.85;
-
-export function shouldCompressImageFile(file: Pick<File, "size" | "type">): boolean {
-  return file.size > CLIENT_IMAGE_COMPRESSION_THRESHOLD_BYTES && file.type !== "image/gif";
-}
-
-function readImageFile(file: Blob, mimeType: string): Promise<{ data: string; mimeType: string }> {
+// Attached images go to pi as they are: pi resizes prompt images itself, following
+// images.autoResize and the model's inputLimits.images.resize.
+export function readImageFile(file: Blob, mimeType: string): Promise<{ data: string; mimeType: string }> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = () => {
@@ -254,34 +517,6 @@ function readImageFile(file: Blob, mimeType: string): Promise<{ data: string; mi
     reader.onerror = reject;
     reader.readAsDataURL(file);
   });
-}
-
-export async function compressImageFile(file: File): Promise<{ data: string; mimeType: string }> {
-  const original = () => readImageFile(file, file.type);
-  if (!shouldCompressImageFile(file) || typeof createImageBitmap !== "function") return original();
-
-  const bitmap = await createImageBitmap(file).catch(() => null);
-  if (!bitmap) return original();
-
-  try {
-    const scale = Math.min(1, CLIENT_MAX_IMAGE_SIDE / Math.max(bitmap.width, bitmap.height));
-    const canvas = document.createElement("canvas");
-    canvas.width = Math.max(1, Math.round(bitmap.width * scale));
-    canvas.height = Math.max(1, Math.round(bitmap.height * scale));
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return original();
-    ctx.fillStyle = "#fff";
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-    ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
-    const data = canvas.toDataURL("image/jpeg", CLIENT_JPEG_QUALITY).split(",")[1];
-    return data && data.length < Math.ceil(file.size / 3) * 4
-      ? { data, mimeType: "image/jpeg" }
-      : original();
-  } catch {
-    return original();
-  } finally {
-    bitmap.close();
-  }
 }
 
 function imageToDraftImage(image: AttachedImage): ChatDraftImage {
@@ -324,9 +559,8 @@ export function getUserMessageDraftImages(message: UserMessage): ChatDraftImage[
     if (block.type !== "image") return [];
 
     // Support both the current nested image format and older flat pi-ai entries.
-    const flat = block as unknown as { data?: unknown; mimeType?: unknown };
-    const data = block.source?.type === "base64" ? block.source.data : flat.data;
-    const mimeType = block.source?.type === "base64" ? block.source.media_type : flat.mimeType;
+    const data = block.source?.type === "base64" ? block.source.data : "data" in block ? block.data : undefined;
+    const mimeType = block.source?.type === "base64" ? block.source.media_type : "mimeType" in block ? block.mimeType : undefined;
     if (typeof data !== "string" || typeof mimeType !== "string") return [];
 
     const image = { data, mimeType };
@@ -372,7 +606,8 @@ function QueuedMessageRow({ kind, text }: { kind: "steer" | "follow-up"; text: s
   );
 }
 
-function ModelNoticeBanner({ tone, title, body }: { tone: "error" | "warning"; title: string; body: string }) {
+function ModelNoticeBanner({ tone, title, body, onClose }: { tone: "error" | "warning"; title: string; body: string; onClose?: () => void }) {
+  const { t } = useI18n();
   const color = tone === "error" ? "239,68,68" : "234,179,8";
   return (
     <div
@@ -409,35 +644,78 @@ function ModelNoticeBanner({ tone, title, body }: { tone: "error" | "warning"; t
         <line x1="12" y1="9" x2="12" y2="13" />
         <line x1="12" y1="17" x2="12.01" y2="17" />
       </svg>
-      <div style={{ minWidth: 0 }}>
+      <div style={{ minWidth: 0, flex: 1 }}>
         <div style={{ fontWeight: 600 }}>{title}</div>
         <div style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{body}</div>
       </div>
+      {onClose && (
+        <button
+          type="button"
+          onClick={onClose}
+          aria-label={t("sidebar.dismiss")}
+          style={{
+            flexShrink: 0,
+            background: "none",
+            border: "none",
+            padding: "0 2px",
+            cursor: "pointer",
+            color: "inherit",
+            opacity: 0.7,
+            fontSize: 13,
+            lineHeight: 1,
+          }}
+        >
+          ×
+        </button>
+      )}
     </div>
   );
 }
 
+/** The session's folder no longer exists: nothing was sent, and no model was asked (#1422). */
+export function MissingCwdBanner({ cwd }: { cwd?: string | null }) {
+  const { t } = useI18n();
+  if (!cwd) return null;
+  return <ModelNoticeBanner tone="error" title={t("chat.cwdMissingTitle")} body={t("chat.cwdMissingBody", { cwd })} />;
+}
+
 export function ModelErrorBanner({ error }: { error?: string | null }) {
+  const { t } = useI18n();
   if (!error) return null;
-  return <ModelNoticeBanner tone="error" title="Model error" body={error} />;
+  return <ModelNoticeBanner tone="error" title={t("chat.modelError")} body={error} />;
+}
+
+/** True when the selected model is known to accept image input (#584). Unknown modality info never blocks the user. */
+export function modelSupportsImageInput(
+  model: { provider: string; modelId: string } | null | undefined,
+  modelList: { id: string; name: string; provider: string; providerName?: string; input?: string[] }[] | undefined
+): boolean {
+  if (!model) return true;
+  const entry = modelList?.find((m) => m.provider === model.provider && m.id === model.modelId);
+  if (!entry || !entry.input) return true;
+  return entry.input.includes("image");
 }
 
 /** Surfaces `enabledModels` patterns that matched nothing, so a typo is visible (#307). */
 export function ModelScopeWarningBanner({ warnings }: { warnings?: string[] }) {
+  const { t } = useI18n();
   if (!warnings || warnings.length === 0) return null;
   return (
     <ModelNoticeBanner
       tone="warning"
-      title={warnings.length > 1 ? "Model scope warnings" : "Model scope warning"}
+      title={warnings.length > 1 ? t("chat.modelScopeWarnings") : t("chat.modelScopeWarning")}
       body={warnings.join("\n")}
     />
   );
 }
 
-export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
-  onSend, onAbort, onSteer, onFollowUp, isStreaming, model, isAutoModelSelection, modelNames, modelList, modelError, modelScopeWarnings, onModelChange, modelSwitching,
-  onCompact, onAbortCompaction, isCompacting, compactError, compactResult, toolPreset, onToolPresetChange,
-  thinkingLevel, onThinkingLevelChange, availableThinkingLevels, thinkingLevelMap,
+// Memoized: its props hold still while a reply streams or a tool runs, and the
+// chat around it re-renders through both.
+export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatInput({
+  onSend, onAbort, onSteer, onSideChat, onFollowUp, isStreaming, backend = "pi", backends, backendsLoading = false, backendsError, onRetryBackends, capabilities, onBackendChange, backendHandoff = false, backendChanging = false, handoffTargetBackend = null, effectiveNativeModel, shellCommandsEnabled = true, model, isAutoModelSelection, modelNames, modelList, modelError, missingCwd, modelScopeWarnings, allModelList, onLoadAllModels, onLoadModels, onModelChange, modelSwitching,
+  defaultModel, onSetDefaultModel,
+  onCompact, onAbortCompaction, isCompacting, compactError, onDismissCompactError, compactResult, toolPreset, onToolPresetChange,
+  reasoning,
   retryInfo, queuedMessages, inputHistory = [], onRecallQueue,
   slashCommands, slashCommandsLoading, onLoadSlashCommands,
   onBuiltinCommand,
@@ -445,9 +723,16 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
   onPromptWithStreamingBehavior,
   draftKey,
   cwd,
+  onAttachFiles,
+  compact = false,
 }: Props, ref) {
   const { t } = useI18n();
+  const { fontSize } = useChatAppearance();
+  const { ui: uiFontFamily, uiWeight } = useFontPreferences();
   const isMobile = useIsMobile();
+  // The controls row under the composer: a finger's 44px on a phone.
+  const controlSize = isMobile ? 44 : 32;
+  const enterSendMode = useEnterSendMode();
   const [value, setValue] = useState(() => (draftKey ? getDraft(draftKey)?.value ?? "" : ""));
   const [toolDropdownOpen, setToolDropdownOpen] = useState(false);
   const [thinkingDropdownOpen, setThinkingDropdownOpen] = useState(false);
@@ -456,16 +741,20 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
     draftKey ? draftImagesToAttachedImages(getDraft(draftKey)?.images) : []
   ));
   const trimmedValue = value.trimStart();
-  const bashMode = attachedImages.length === 0 && trimmedValue.startsWith("!");
+  const bashMode = shellCommandsEnabled && attachedImages.length === 0 && trimmedValue.startsWith("!");
   const bashExcluded = bashMode && trimmedValue.startsWith("!!");
   const [slashMenuOpen, setSlashMenuOpen] = useState(false);
   const [slashActiveIndex, setSlashActiveIndex] = useState(0);
   const [slashMenuMaxHeight, setSlashMenuMaxHeight] = useState<number | null>(null);
   const [atQuery, setAtQuery] = useState<AtQueryMatch | null>(null);
   const [atMenuOpen, setAtMenuOpen] = useState(false);
+  const [atMenuMaxHeight, setAtMenuMaxHeight] = useState<number | null>(null);
   const [atActiveIndex, setAtActiveIndex] = useState(0);
+  const [imageWarningDismissed, setImageWarningDismissed] = useState(false);
   const [historyMenuOpen, setHistoryMenuOpen] = useState(false);
   const [historyActiveIndex, setHistoryActiveIndex] = useState(0);
+  const [builtinCommandPending, setBuiltinCommandPending] = useState(false);
+  const builtinCommandPendingRef = useRef(false);
   const [fileIndex, setFileIndex] = useState<{ cwd: string; entries: FileIndexEntry[]; truncated: boolean } | null>(null);
   const [fileIndexLoading, setFileIndexLoading] = useState(false);
   const [atServerResult, setAtServerResult] = useState<{ cwd: string; query: string; matches: FileIndexEntry[] } | null>(null);
@@ -485,9 +774,11 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
   const fileInputRef = useRef<HTMLInputElement>(null);
   const isComposingRef = useRef(false);
   const lastCompositionEndAtRef = useRef(0);
+  const pendingPasteRef = useRef<object | null>(null);
   const slashCommandsRequestedRef = useRef(false);
   const slashMenuRef = useRef<HTMLDivElement>(null);
   const slashItemRefs = useRef<Array<HTMLButtonElement | null>>([]);
+  const atMenuRef = useRef<HTMLDivElement>(null);
   const atItemRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const historyItemRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const fileIndexMetaRef = useRef<{ cwd: string; fetchedAt: number } | null>(null);
@@ -510,8 +801,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
       requestAnimationFrame(() => {
         if (!ta) return;
         ta.focus();
-        ta.style.height = "auto";
-        ta.style.height = `${Math.min(ta.scrollHeight, 200)}px`;
+        autoGrowTextarea(ta);
       });
     },
     replaceMessage(message: UserMessage) {
@@ -533,8 +823,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
       requestAnimationFrame(() => {
         if (!ta) return;
         ta.focus();
-        ta.style.height = "auto";
-        ta.style.height = `${Math.min(ta.scrollHeight, 200)}px`;
+        autoGrowTextarea(ta);
       });
     },
     prependText(text: string) {
@@ -551,8 +840,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
         if (!ta) return;
         ta.focus();
         ta.setSelectionRange(combined.length, combined.length);
-        ta.style.height = "auto";
-        ta.style.height = `${Math.min(ta.scrollHeight, 200)}px`;
+        autoGrowTextarea(ta);
       });
     },
     rekeyDraft(previousKey: string, nextKey: string) {
@@ -647,9 +935,15 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
         if (!ta) return;
         ta.focus();
         ta.setSelectionRange(ta.value.length, ta.value.length);
-        ta.style.height = "auto";
-        ta.style.height = `${Math.min(ta.scrollHeight, 200)}px`;
+        autoGrowTextarea(ta);
       });
+    },
+    // The caret goes after a draft that came back, so typing continues it.
+    focus() {
+      const ta = textareaRef.current;
+      if (!ta) return;
+      ta.focus();
+      ta.setSelectionRange(ta.value.length, ta.value.length);
     },
     insertText(text: string) {
       const ta = textareaRef.current;
@@ -660,20 +954,20 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
       const start = ta.selectionStart ?? ta.value.length;
       const end = ta.selectionEnd ?? ta.value.length;
       const before = ta.value.slice(0, start);
-      const after = ta.value.slice(end);
       const sep = before.length > 0 && !before.endsWith(" ") ? " " : "";
-      const newVal = before + sep + text + after;
-      valueRef.current = newVal;
-      setValue(newVal);
+      replaceTextareaRange(ta, start, end, sep + text);
       setAtQuery(null);
-      requestAnimationFrame(() => {
-        if (!ta) return;
-        const pos = start + sep.length + text.length;
-        ta.setSelectionRange(pos, pos);
-        ta.focus();
-        ta.style.height = "auto";
-        ta.style.height = `${Math.min(ta.scrollHeight, 200)}px`;
-      });
+    },
+    insertQuote(text: string) {
+      const ta = textareaRef.current;
+      if (!ta) {
+        setValue((v) => v + quoteSeparator(v) + text);
+        return;
+      }
+      const start = ta.selectionStart ?? ta.value.length;
+      const end = ta.selectionEnd ?? ta.value.length;
+      replaceTextareaRange(ta, start, end, quoteSeparator(ta.value.slice(0, start)) + text);
+      setAtQuery(null);
     },
     addImages(files: File[]) {
       processImageFiles(files);
@@ -681,6 +975,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
   }));
 
   const processImageFiles = useCallback(async (files: File[]) => {
+    if (compact) return;
     const remaining = Math.max(
       0,
       MAX_ATTACHED_IMAGES - attachedImagesRef.current.length - pendingImageCountRef.current,
@@ -693,7 +988,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
     try {
       const newImages = await Promise.all(
         imageFiles.map(async (file) => ({
-          ...await compressImageFile(file),
+          ...await readImageFile(file, file.type),
           previewUrl: URL.createObjectURL(file),
         }))
       );
@@ -707,7 +1002,15 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
     } finally {
       pendingImageCountRef.current -= imageFiles.length;
     }
-  }, []);
+  }, [compact]);
+
+  const handleFilePick = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files ?? []);
+    // Clearing the value lets the same file be picked again.
+    e.target.value = "";
+    if (onAttachFiles) onAttachFiles(files);
+    else processImageFiles(files);
+  }, [onAttachFiles, processImageFiles]);
 
   const removeImage = useCallback((index: number) => {
     setAttachedImages((prev) => {
@@ -774,12 +1077,48 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
     });
   }, [draftKey]);
 
-  useEffect(() => {
+  const resizeTextarea = useCallback(() => {
     const ta = textareaRef.current;
     if (!ta) return;
     ta.style.height = "auto";
-    if (value) ta.style.height = `${Math.min(ta.scrollHeight, 200)}px`;
-  }, [value]);
+    if (ta.value) autoGrowTextarea(ta);
+    else ta.style.overflowY = "hidden";
+  }, []);
+
+  useLayoutEffect(resizeTextarea, [value, fontSize, uiFontFamily, uiWeight, resizeTextarea]);
+
+  useEffect(() => {
+    const ta = textareaRef.current;
+    if (!ta) return;
+    let previousWidth = -1;
+    const observer = new ResizeObserver(([entry]) => {
+      // Height updates also notify the observer; only remeasure on width changes.
+      if (entry.contentRect.width === previousWidth) return;
+      previousWidth = entry.contentRect.width;
+      resizeTextarea();
+    });
+    observer.observe(ta);
+    return () => observer.disconnect();
+  }, [resizeTextarea]);
+
+  useEffect(() => {
+    const ta = textareaRef.current;
+    if (!ta) return;
+    // Shift+Enter on desktop, Enter on mobile keyboards: every newline the
+    // textarea inserts arrives here, while IME confirmations and sends do not.
+    const continueList = (event: InputEvent) => {
+      if (event.inputType !== "insertLineBreak" || event.isComposing) return;
+      const edit = getMarkdownListContinuation(ta.value, ta.selectionStart, ta.selectionEnd);
+      if (!edit) return;
+      event.preventDefault();
+      ta.setSelectionRange(edit.start, edit.end);
+      // insertText keeps the edit on the native undo stack and fires the input
+      // event that updates the controlled value.
+      document.execCommand(edit.text ? "insertText" : "delete", false, edit.text);
+    };
+    ta.addEventListener("beforeinput", continueList);
+    return () => ta.removeEventListener("beforeinput", continueList);
+  }, []);
 
   useEffect(() => {
     return () => {
@@ -789,57 +1128,63 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
 
   const runBuiltinCommand = useCallback(async (msg: string): Promise<boolean> => {
     if (attachedImages.length || !msg.startsWith("/") || !onBuiltinCommand) return false;
-    const result = await onBuiltinCommand(msg);
-    if (!result.handled) return false;
-    if (!result.error && canClearBuiltinCommandInput(valueRef.current, attachedImagesRef.current.length, msg)) clearInput();
-    return true;
+    if (builtinCommandPendingRef.current) return true;
+    builtinCommandPendingRef.current = true;
+    setBuiltinCommandPending(true);
+    try {
+      const result = await onBuiltinCommand(msg);
+      if (!result.handled) return false;
+      if (!result.error && canClearBuiltinCommandInput(valueRef.current, attachedImagesRef.current.length, msg)) clearInput();
+      return true;
+    } finally {
+      builtinCommandPendingRef.current = false;
+      setBuiltinCommandPending(false);
+    }
   }, [attachedImages.length, clearInput, onBuiltinCommand]);
 
   const handleSend = useCallback(async () => {
     const msg = value.trim();
     if (!msg && !attachedImages.length) return;
     onAudioUnlock?.();
-    const builtinAllowed = !isStreaming || canRunBuiltinSlashCommandWhileStreaming(msg);
+    const builtinAllowed = !isStreaming || offersBuiltinSlashCommandWhileStreaming(msg);
     if (builtinAllowed && await runBuiltinCommand(msg)) return;
     if (isStreaming) return;
     clearInput();
     onSend(msg, attachedImages.length ? attachedImages : undefined);
   }, [value, attachedImages, isStreaming, runBuiltinCommand, onSend, clearInput, onAudioUnlock]);
 
-  const slashQuery = value.startsWith("/") && !/\s/.test(value.slice(1))
+  const slashQuery = !compact && value.startsWith("/") && !/\s/.test(value.slice(1))
     ? value.slice(1).toLowerCase()
     : null;
 
   const filteredSlashCommands = (() => {
     if (slashQuery === null) return [];
-    const builtinCommands = isStreaming
-      ? BUILTIN_SLASH_COMMANDS.filter((command) => command.availableWhileStreaming)
-      : BUILTIN_SLASH_COMMANDS;
-    const commands = [...builtinCommands, ...(slashCommands ?? [])];
-    return [...commands]
-      .filter((command) => {
-        const name = command.name.toLowerCase();
-        const description = getSlashDescription(command, t).toLowerCase();
-        return name.includes(slashQuery) || description.includes(slashQuery);
-      })
-      .sort((a, b) => {
-        const rankDelta = slashMatchRank(a, slashQuery, t) - slashMatchRank(b, slashQuery, t);
-        if (rankDelta !== 0) return rankDelta;
-        return SLASH_SOURCE_ORDER[a.source] - SLASH_SOURCE_ORDER[b.source]
-          || TEXT_COLLATOR.compare(a.name, b.name);
-      });
+    const allowedBuiltins = getVisibleBuiltinSlashCommands(backend, capabilities, isStreaming);
+    const commands = [...allowedBuiltins, ...(slashCommands ?? [])];
+    return filterSlashCommands(commands, slashQuery, t);
   })();
 
   const {
     commands: displayedSlashCommands,
     groups: groupedSlashCommands,
-  } = buildSlashCommandLayout(filteredSlashCommands, skillDormancy);
+  } = buildSlashCommandLayout(filteredSlashCommands, skillDormancy, slashQuery ?? "");
 
   const slashCommandCountLabel = filteredSlashCommands.length === 1
     ? t(slashQuery ? "chat.match" : "chat.command")
     : t(slashQuery ? "chat.matches" : "chat.commands", { count: filteredSlashCommands.length });
   const hasInputText = Boolean(value.trim());
   const canQueueStreamingMessage = hasInputText || attachedImages.length > 0;
+  const stackedComposer = stacksComposerLayout(compact, isMobile, isStreaming);
+  // Warn when images are attached but the selected model is known not to accept
+  // image input (#584), including a resolved default. Unknown models stay silent.
+  const showImageUnsupportedWarning = (
+    attachedImages.length > 0
+    && !modelSupportsImageInput(model, modelList)
+    && !imageWarningDismissed
+  );
+  useEffect(() => {
+    if (attachedImages.length === 0) setImageWarningDismissed(false);
+  }, [attachedImages.length]);
 
   // ── @ file autocomplete ──────────────────────────────────────────────────
   // Recomputed from the text before the caret on every change/caret move.
@@ -936,32 +1281,18 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
   const applyAtCompletion = useCallback((entry: FileIndexEntry) => {
     if (!atQuery) return;
     const ta = textareaRef.current;
-    const cursor = ta?.selectionStart ?? value.length;
-    const before = value.slice(0, atQuery.start);
-    let after = value.slice(cursor);
+    if (!ta) return;
+    const cursor = ta.selectionStart ?? ta.value.length;
     // Completing inside a quoted token (@"my dir/… with the caret before the
-    // closing quote): the replacement carries its own closing quote, so drop
-    // the old one right after the caret (mirrors the TUI's applyCompletion).
-    if (atQuery.quoted && after.startsWith('"')) {
-      after = after.slice(1);
-    }
+    // closing quote): replace that old quote too, since the insertion has one.
+    const replaceEnd = cursor + (atQuery.quoted && ta.value[cursor] === '"' ? 1 : 0);
     const insert = buildAtInsertText(entry.path, entry.isDir, atQuery.quoted);
-    const newValue = before + insert.text + after;
-    const newPos = before.length + insert.cursorOffset;
-    setValue(newValue);
-    // setValue alone does not fire onChange — re-derive the token here. Files
-    // end with a space (token closes, menu hides); directories end with "/"
-    // before the caret (token stays open for drill-down into the directory).
-    setAtQuery(extractAtQuery(newValue.slice(0, newPos)));
-    requestAnimationFrame(() => {
-      const el = textareaRef.current;
-      if (!el) return;
-      el.focus();
-      el.setSelectionRange(newPos, newPos);
-      el.style.height = "auto";
-      el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
-    });
-  }, [atQuery, value]);
+    const newPos = atQuery.start + insert.cursorOffset;
+    replaceTextareaRange(ta, atQuery.start, replaceEnd, insert.text, insert.cursorOffset);
+    // The native input event updates the controlled value. Re-derive using the
+    // adjusted caret because quoted directories place it before the last quote.
+    setAtQuery(extractAtQuery(ta.value.slice(0, newPos)));
+  }, [atQuery]);
 
   useEffect(() => {
     if (atActiveIndex >= atMatches.length) {
@@ -1003,8 +1334,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
       if (!ta) return;
       ta.focus();
       ta.setSelectionRange(text.length, text.length);
-      ta.style.height = "auto";
-      ta.style.height = `${Math.min(ta.scrollHeight, 200)}px`;
+      autoGrowTextarea(ta);
     });
   }, []);
 
@@ -1018,31 +1348,49 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
       if (!ta) return;
       ta.focus();
       ta.setSelectionRange(nextValue.length, nextValue.length);
-      ta.style.height = "auto";
-      ta.style.height = `${Math.min(ta.scrollHeight, 200)}px`;
+      autoGrowTextarea(ta);
     });
   }, []);
+
+  const sendToSideChat = useCallback(() => {
+    const msg = value.trim();
+    if (!msg || attachedImages.length || !onSideChat) return;
+    clearInput();
+    onSideChat(msg);
+  }, [value, attachedImages, onSideChat, clearInput]);
 
   const sendQueued = useCallback((mode: "steer" | "followup") => {
     const msg = value.trim();
     if (!msg && !attachedImages.length) return;
     onAudioUnlock?.();
+    const images = attachedImages.length ? attachedImages : undefined;
+    const queue = () => {
+      const streamingBehavior = mode === "steer" ? "steer" : "followUp";
+      if (msg.startsWith("/") && onPromptWithStreamingBehavior) {
+        clearInput();
+        onPromptWithStreamingBehavior(msg, streamingBehavior, images);
+        return;
+      }
+      clearInput();
+      if (mode === "steer" && onSteer) {
+        onSteer(msg, images);
+      } else if (mode === "followup" && onFollowUp) {
+        onFollowUp(msg, images);
+      }
+    };
     if (!attachedImages.length && onBuiltinCommand && canRunBuiltinSlashCommandWhileStreaming(msg)) {
       void runBuiltinCommand(msg);
       return;
     }
-    const streamingBehavior = mode === "steer" ? "steer" : "followUp";
-    if (msg.startsWith("/") && onPromptWithStreamingBehavior) {
-      clearInput();
-      onPromptWithStreamingBehavior(msg, streamingBehavior, attachedImages.length ? attachedImages : undefined);
+    if (!attachedImages.length && onBuiltinCommand && isBareMcpCommand(msg)) {
+      // Settings › MCP opens when pi's built-in MCP extension owns /mcp; another
+      // extension's /mcp is queued as before. The composer is disabled meanwhile.
+      void runBuiltinCommand(msg).then((handled) => {
+        if (!handled) queue();
+      }, () => queue());
       return;
     }
-    clearInput();
-    if (mode === "steer" && onSteer) {
-      onSteer(msg, attachedImages.length ? attachedImages : undefined);
-    } else if (mode === "followup" && onFollowUp) {
-      onFollowUp(msg, attachedImages.length ? attachedImages : undefined);
-    }
+    queue();
   }, [value, attachedImages, onBuiltinCommand, onPromptWithStreamingBehavior, onSteer, onFollowUp, clearInput, onAudioUnlock, runBuiltinCommand]);
 
   const getNextSlashIndex = useCallback((direction: "up" | "down" | "left" | "right") => {
@@ -1091,14 +1439,21 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
   const handleKeyDown = useCallback(
     (e: KeyboardEvent<HTMLTextAreaElement>) => {
       const nativeEvent = e.nativeEvent;
-      const sendShortcut = e.key === "Enter" && !e.shiftKey && (!isMobile || e.ctrlKey || e.metaKey);
+      const enterKey = e.key === "Enter" && !e.shiftKey;
+      const sendShortcut = isMobile || enterSendMode === "ctrlEnter"
+        ? enterKey && (e.ctrlKey || e.metaKey)
+        : enterKey;
+      // Popup menus and the IME guard take plain Enter in either send mode on a
+      // desktop keyboard. Mobile keyboards insert a line break on Enter, so they
+      // keep using the send shortcut there.
+      const acceptShortcut = isMobile ? sendShortcut : enterKey;
       const recentlyComposed = Date.now() - lastCompositionEndAtRef.current < COMPOSITION_END_ENTER_GRACE_MS;
       const isComposing =
         isComposingRef.current ||
         nativeEvent.isComposing ||
         nativeEvent.keyCode === 229;
 
-      if (sendShortcut && (isComposing || recentlyComposed)) {
+      if (acceptShortcut && (isComposing || recentlyComposed)) {
         if (recentlyComposed) e.preventDefault();
         return;
       }
@@ -1119,7 +1474,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
           setHistoryMenuOpen(false);
           return;
         }
-        if ((e.key === "Tab" || sendShortcut) && inputHistory[historyActiveIndex]) {
+        if ((e.key === "Tab" || acceptShortcut) && inputHistory[historyActiveIndex]) {
           e.preventDefault();
           applyHistoryInput(inputHistory[historyActiveIndex]);
           return;
@@ -1158,11 +1513,9 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
           applySlashCommand(selectedCommand);
           return;
         }
-        if (sendShortcut && selectedCommand) {
+        if (acceptShortcut && selectedCommand) {
           e.preventDefault();
-          const canSubmitNow = !isStreaming
-            || (selectedCommand.source === "builtin" && selectedCommand.availableWhileStreaming === true);
-          if (canSubmitNow && isExactSlashCommand(value, selectedCommand)) {
+          if (sendShortcut && submitsSlashCommandOnEnter(value, selectedCommand, isStreaming)) {
             setSlashMenuOpen(false);
             void handleSend();
           } else {
@@ -1177,12 +1530,12 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
       if (atMenuOpen && atQuery !== null && !isComposing) {
         if (e.key === "ArrowDown") {
           e.preventDefault();
-          setAtActiveIndex((i) => Math.min(Math.max(0, atMatches.length - 1), i + 1));
+          setAtActiveIndex((i) => cycleListIndex(i, atMatches.length, 1));
           return;
         }
         if (e.key === "ArrowUp") {
           e.preventDefault();
-          setAtActiveIndex((i) => Math.max(0, i - 1));
+          setAtActiveIndex((i) => cycleListIndex(i, atMatches.length, -1));
           return;
         }
         if (e.key === "Escape") {
@@ -1190,7 +1543,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
           setAtMenuOpen(false);
           return;
         }
-        if ((e.key === "Tab" || sendShortcut) && atMatches[atActiveIndex]) {
+        if ((e.key === "Tab" || acceptShortcut) && atMatches[atActiveIndex]) {
           e.preventDefault();
           applyAtCompletion(atMatches[atActiveIndex]);
           return;
@@ -1216,31 +1569,79 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
       if (sendShortcut) {
         e.preventDefault();
         if (isStreaming && (onSteer || onFollowUp)) {
-          // Default Enter sends as steer if available, else followup
-          sendQueued(onSteer ? "steer" : "followup");
+          sendQueued((e.altKey && onFollowUp) || !onSteer ? "followup" : "steer");
         } else {
           handleSend();
         }
       }
     },
-    [isMobile, isStreaming, onSteer, onFollowUp, onAbort, slashMenuOpen, slashQuery, displayedSlashCommands, slashActiveIndex, applySlashCommand, sendQueued, handleSend, getNextSlashIndex, atMenuOpen, atQuery, atMatches, atActiveIndex, applyAtCompletion, historyMenuOpen, inputHistory, historyActiveIndex, applyHistoryInput, value]
+    [isMobile, enterSendMode, isStreaming, onSteer, onFollowUp, onAbort, slashMenuOpen, slashQuery, displayedSlashCommands, slashActiveIndex, applySlashCommand, sendQueued, handleSend, getNextSlashIndex, atMenuOpen, atQuery, atMatches, atActiveIndex, applyAtCompletion, historyMenuOpen, inputHistory, historyActiveIndex, applyHistoryInput, value]
   );
 
   const handleInput = useCallback(() => {
+    pendingPasteRef.current = null;
     const ta = textareaRef.current;
     if (!ta) return;
-    ta.style.height = "auto";
-    ta.style.height = `${Math.min(ta.scrollHeight, 200)}px`;
+    autoGrowTextarea(ta);
   }, []);
 
-  const handlePaste = useCallback((e: React.ClipboardEvent) => {
+  const handlePaste = useCallback((e: React.ClipboardEvent<HTMLTextAreaElement>) => {
     const items = Array.from(e.clipboardData?.items ?? []);
     const imageItems = items.filter((item) => item.type.startsWith("image/"));
-    if (!imageItems.length) return;
+    if (!compact && imageItems.length) {
+      e.preventDefault();
+      const files = imageItems.map((item) => item.getAsFile()).filter((f): f is File => f !== null);
+      processImageFiles(files);
+      return;
+    }
+
+    const html = e.clipboardData.getData("text/html");
+    const text = e.clipboardData.getData("text/plain");
+    if (text) {
+      // A dictation tool that pastes and then restores the clipboard can write
+      // it during this event; Chrome then drops its own insertion (#1513). When
+      // no input followed the paste, insert the text the event delivered.
+      const ta = e.currentTarget;
+      const native = e.nativeEvent;
+      const start = ta.selectionStart;
+      const end = ta.selectionEnd;
+      const paste = {};
+      pendingPasteRef.current = paste;
+      setTimeout(() => {
+        if (pendingPasteRef.current !== paste) return;
+        pendingPasteRef.current = null;
+        if (!native.defaultPrevented && ta.isConnected) replaceTextareaRange(ta, start, end, text);
+      }, 0);
+    }
+    if (!html || !text) return;
+    const document = new DOMParser().parseFromString(html, "text/html");
+    const links = Array.from(document.querySelectorAll("a[href]"), (link) => {
+      const label = link.textContent ?? "";
+      const range = document.createRange();
+      range.setStart(document.body, 0);
+      range.setEndBefore(link);
+      return {
+        label,
+        href: link.getAttribute("href")?.trim() ?? "",
+        occurrence: label ? range.toString().split(label).length - 1 : 0,
+      };
+    });
+    const markdown = replaceLinksWithMarkdown(text, links);
+    if (markdown === null) return;
+
+    const ta = e.currentTarget;
+    const start = ta.selectionStart;
+    const nextValue = ta.value.slice(0, start) + markdown + ta.value.slice(ta.selectionEnd);
     e.preventDefault();
-    const files = imageItems.map((item) => item.getAsFile()).filter((f): f is File => f !== null);
-    processImageFiles(files);
-  }, [processImageFiles]);
+    valueRef.current = nextValue;
+    setValue(nextValue);
+    setHistoryMenuOpen(false);
+    updateAtQuery(nextValue, start + markdown.length);
+    requestAnimationFrame(() => {
+      ta.focus();
+      ta.setSelectionRange(start + markdown.length, start + markdown.length);
+    });
+  }, [compact, processImageFiles, updateAtQuery]);
 
   useEffect(() => {
     if (slashQuery === null) {
@@ -1263,7 +1664,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
   // palette opens, so toggles made in the skills panel are reflected on the
   // next open. Failures degrade silently to the unannotated palette.
   useEffect(() => {
-    if (!slashMenuOpen || !cwd) return;
+    if (backend === "codex" || !slashMenuOpen || !cwd) return;
     const requestCwd = cwd;
     let cancelled = false;
     setSkillDormancyState({ cwd: requestCwd, values: {} });
@@ -1284,7 +1685,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
     return () => {
       cancelled = true;
     };
-  }, [slashMenuOpen, cwd]);
+  }, [backend, slashMenuOpen, cwd]);
 
   useEffect(() => {
     if (slashActiveIndex >= displayedSlashCommands.length) {
@@ -1306,49 +1707,29 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
       setSlashMenuMaxHeight(null);
       return;
     }
-
     const menu = slashMenuRef.current;
     if (!menu) return;
-
-    let frameId: number | null = null;
-    const update = () => {
-      frameId = null;
-      const nextHeight = getUpwardMenuMaxHeight(
-        menu.getBoundingClientRect().bottom,
-        getVisibleTopBoundary(menu),
-      );
+    return subscribeUpwardMenuMaxHeight(menu, (nextHeight) => {
       setSlashMenuMaxHeight((current) => current === nextHeight ? current : nextHeight);
-    };
-    const scheduleUpdate = () => {
-      if (frameId !== null) cancelAnimationFrame(frameId);
-      frameId = requestAnimationFrame(update);
-    };
-
-    update();
-    const anchorObserver = typeof ResizeObserver === "undefined" || !menu.parentElement
-      ? null
-      : new ResizeObserver(scheduleUpdate);
-    if (menu.parentElement) anchorObserver?.observe(menu.parentElement);
-    const viewport = window.visualViewport;
-    viewport?.addEventListener("resize", scheduleUpdate);
-    viewport?.addEventListener("scroll", scheduleUpdate);
-    window.addEventListener("resize", scheduleUpdate);
-    window.addEventListener("scroll", scheduleUpdate, true);
-
-    return () => {
-      anchorObserver?.disconnect();
-      viewport?.removeEventListener("resize", scheduleUpdate);
-      viewport?.removeEventListener("scroll", scheduleUpdate);
-      window.removeEventListener("resize", scheduleUpdate);
-      window.removeEventListener("scroll", scheduleUpdate, true);
-      if (frameId !== null) cancelAnimationFrame(frameId);
-    };
+    });
   }, [slashMenuOpen, slashQuery]);
+
+  useLayoutEffect(() => {
+    if (!atMenuOpen || atQuery === null) {
+      setAtMenuMaxHeight(null);
+      return;
+    }
+    const menu = atMenuRef.current;
+    if (!menu) return;
+    return subscribeUpwardMenuMaxHeight(menu, (nextHeight) => {
+      setAtMenuMaxHeight((current) => current === nextHeight ? current : nextHeight);
+    });
+  }, [atMenuOpen, atQuery]);
 
   // Build model options: prefer modelList (has provider info), fallback to modelNames
   const modelOptions: ModelSelectorOption[] = (() => {
     if (modelList && modelList.length > 0) {
-      return modelList.map((m) => ({ provider: m.provider, modelId: m.id, name: m.name }));
+      return modelList.map((m) => ({ provider: m.provider, providerName: m.providerName, modelId: m.id, name: m.name }));
     }
     return Object.entries(modelNames ?? {}).map(([modelId, name]) => ({
       provider: model?.provider ?? "unknown",
@@ -1363,12 +1744,8 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
   const compactResultText = compactResult
     ? `${compactResult.reason && compactResult.reason !== "manual" ? `${compactResult.reason[0].toUpperCase()}${compactResult.reason.slice(1)} ` : t("chat.compacted")} ${formatTokenCount(compactResult.tokensBefore)} -> ${formatTokenCount(compactResult.estimatedTokensAfter)} tokens (${t("chat.tokensSaved", { saved: formatTokenCount(compactSavedTokens) })})`
     : null;
-  const thinkingDisplayLabel = (() => {
-    const lvl = thinkingLevel ?? "auto";
-    if (lvl === "auto" || !thinkingLevelMap) return lvl;
-    return thinkingLevelMap[lvl] ?? lvl;
-  })();
-  const rawToolPresetLabel = Object.entries(TOOL_PRESET_MAP).find(([, v]) => v === (toolPreset ?? "default"))?.[0] ?? "default";
+  const thinkingDisplayLabel = reasoning?.label ?? "";
+  const rawToolPresetLabel = Object.entries(TOOL_PRESET_MAP).find(([, v]) => v === (toolPreset ?? "configured"))?.[0] ?? "configured";
   const toolPresetLabel = rawToolPresetLabel === "chat-only" ? t("chat.chatOnly") : rawToolPresetLabel;
 
   // Close dropdowns on outside click
@@ -1392,39 +1769,72 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
   }, []);
 
   useEffect(() => {
+    if (!isStreaming) return;
+    setToolDropdownOpen(false);
+  }, [isStreaming]);
+
+  // Set in the commit that swaps Stop for Compact, before any click can reach it.
+  const runEndedAtRef = useRef(Number.NEGATIVE_INFINITY);
+  useLayoutEffect(() => {
+    if (!isStreaming) return;
+    return () => { runEndedAtRef.current = performance.now(); };
+  }, [isStreaming]);
+  const isStrayClick = (e: React.MouseEvent) => isRunEndStrayClick(e.detail, performance.now() - runEndedAtRef.current);
+
+  useEffect(() => {
     if (!isMobile) setControlsMenuOpen(false);
   }, [isMobile]);
 
 
 
   return (
-    <div
+    <fieldset
+      disabled={builtinCommandPending}
+      aria-busy={builtinCommandPending}
+      className={compact ? undefined : "chat-input-shell"}
       style={{
-        flexShrink: 0,
+        // Never taller than the chat: a short window shrinks the queue first (#1428).
+        ...(compact ? { flexShrink: 0 } : { display: "flex", flexDirection: "column", minHeight: 0 }),
+        minWidth: 0,
+        margin: 0,
+        border: 0,
         background: "transparent",
-        padding: "0 16px 8px",
-        paddingRight: isMobile ? 16 : 52, // desktop: 16px base + 36px for ChatMinimap alignment
+        padding: compact ? 0 : "0 16px 8px",
+        paddingRight: compact ? 0 : isMobile ? 16 : 52, // desktop: 16px base + 36px for ChatMinimap alignment
+        opacity: builtinCommandPending ? 0.5 : 1,
+        transition: "opacity 0.15s",
       }}
     >
-      {/* Hidden file input */}
-      <input
+      {/* Hidden file input. No `capture`: phones still offer the photo library and camera. */}
+      {!compact && <input
         ref={fileInputRef}
         type="file"
-        accept="image/*"
+        accept={onAttachFiles ? undefined : "image/*"}
         multiple
         style={{ display: "none" }}
-        onChange={(e) => {
-          const files = Array.from(e.target.files ?? []);
-          processImageFiles(files);
-          e.target.value = "";
-        }}
-      />
-      <div style={{ maxWidth: 820, margin: "0 auto" }}>
+        onChange={handleFilePick}
+      />}
+      <div style={{ ...(compact ? undefined : { display: "flex", flexDirection: "column", minHeight: 0, width: "100%" }), maxWidth: "var(--chat-content-max-width, 820px)", margin: "0 auto" }}>
+        <MissingCwdBanner cwd={missingCwd} />
         <ModelErrorBanner error={modelError} />
         <ModelScopeWarningBanner warnings={modelScopeWarnings} />
+        {showImageUnsupportedWarning && (() => {
+          const entry = modelList?.find((m) => m.provider === model?.provider && m.id === model?.modelId);
+          return (
+            <ModelNoticeBanner
+              tone="warning"
+              title={t("chat.imageNotSupportedTitle")}
+              body={t("chat.imageNotSupportedBody", { model: entry?.name || model?.modelId || "" })}
+              onClose={() => setImageWarningDismissed(true)}
+            />
+          );
+        })()}
         {/* Queued steering / follow-up messages (delivered by pi on upcoming turns) */}
         {((queuedMessages?.steering.length ?? 0) + (queuedMessages?.followUp.length ?? 0)) > 0 && (
           <div style={{
+            display: "flex",
+            flexDirection: "column",
+            minHeight: 72, // the header and one whole row
             marginBottom: 8,
             border: "1px solid var(--border)",
             borderRadius: 6,
@@ -1482,12 +1892,19 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
                 </button>
               )}
             </div>
-            {queuedMessages?.steering.map((text, i) => (
-              <QueuedMessageRow key={`steer-${i}`} kind="steer" text={text} />
-            ))}
-            {queuedMessages?.followUp.map((text, i) => (
-              <QueuedMessageRow key={`followup-${i}`} kind="follow-up" text={text} />
-            ))}
+            {/* Only the rows scroll: a long queue must not push the input and its buttons off screen (#1428). */}
+            <div style={{
+              maxHeight: "min(180px, calc(var(--app-viewport-height, 100dvh) * 0.25))",
+              overflowY: "auto",
+              overscrollBehavior: "contain",
+            }}>
+              {queuedMessages?.steering.map((text, i) => (
+                <QueuedMessageRow key={`steer-${i}`} kind="steer" text={text} />
+              ))}
+              {queuedMessages?.followUp.map((text, i) => (
+                <QueuedMessageRow key={`followup-${i}`} kind="follow-up" text={text} />
+              ))}
+            </div>
           </div>
         )}
         {/* Retry banner */}
@@ -1522,8 +1939,11 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
           <div
             role="alert"
             style={{
+              display: "flex",
+              alignItems: "flex-start",
+              gap: 6,
               marginBottom: 8,
-              padding: "7px 10px",
+              padding: onDismissCompactError ? "3px 3px 3px 10px" : "7px 10px",
               background: "rgba(239,68,68,0.07)",
               border: "1px solid rgba(239,68,68,0.3)",
               borderRadius: 6,
@@ -1531,11 +1951,10 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
               fontFamily: "var(--font-mono)",
               fontSize: 12,
               lineHeight: 1.5,
-              whiteSpace: "pre-wrap",
-              overflowWrap: "anywhere",
             }}
           >
-            {compactError}
+            <span style={{ minWidth: 0, flex: 1, padding: onDismissCompactError ? "4px 0" : 0, whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{compactError}</span>
+            {onDismissCompactError && <DismissButton onClick={onDismissCompactError} title={t("chat.dismissCompactError")} />}
           </div>
         )}
         {/* Image previews */}
@@ -1543,13 +1962,16 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
           <div style={{ display: "flex", gap: 6, marginBottom: 6, flexWrap: "wrap" }}>
             {attachedImages.map((img, i) => (
               <div key={i} style={{ position: "relative", flexShrink: 0 }}>
-                {/* eslint-disable-next-line @next/next/no-img-element */}
-                <img
-                  src={img.previewUrl}
-                  alt=""
-                  style={{ width: 56, height: 56, objectFit: "cover", borderRadius: 6, border: "1px solid var(--border)", display: "block" }}
-                />
+                <ImagePreview key={img.previewUrl} src={img.previewUrl}>
+                  {/* eslint-disable-next-line @next/next/no-img-element */}
+                  <img
+                    src={img.previewUrl}
+                    alt=""
+                    style={{ width: 56, height: 56, objectFit: "cover", borderRadius: 6, border: "1px solid var(--border)", display: "block" }}
+                  />
+                </ImagePreview>
                 <button
+                  type="button"
                   onClick={() => removeImage(i)}
                   style={{
                     position: "absolute", top: -4, right: -4,
@@ -1588,7 +2010,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
               }}
             >
               <div
-                title="Input history"
+                title={t("chat.inputHistory")}
                 style={{
                   height: 30,
                   padding: "0 10px",
@@ -1818,6 +2240,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
               : "";
             return (
               <div
+                ref={atMenuRef}
                 style={{
                   position: "absolute",
                   left: 0,
@@ -1829,7 +2252,12 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
                   borderRadius: 8,
                   boxShadow: "0 -6px 20px rgba(0,0,0,0.12)",
                   overflow: "hidden",
-                  maxHeight: "min(48vh, 400px)",
+                  boxSizing: "border-box",
+                  display: "flex",
+                  flexDirection: "column",
+                  maxHeight: atMenuMaxHeight === null
+                    ? "min(48vh, 400px)"
+                    : `min(48vh, 400px, ${atMenuMaxHeight}px)`,
                 }}
               >
                 <div
@@ -1842,6 +2270,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
                     gap: 8,
                     fontSize: 11,
                     color: "var(--text-dim)",
+                    flexShrink: 0,
                   }}
                 >
                   <span>
@@ -1851,7 +2280,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
                   </span>
                    <span style={{ fontFamily: "var(--font-mono)" }}>{t("chat.tabEnter")}</span>
                 </div>
-                <div style={{ maxHeight: "calc(min(48vh, 400px) - 34px)", overflowY: "auto", padding: 4 }}>
+                <div style={{ flex: "1 1 auto", minHeight: 0, overflowY: "auto", padding: 4 }}>
                   {!indexLoading && atMatches.length === 0 ? (
                     <div style={{ padding: "6px 8px", fontSize: 12, color: "var(--text-dim)" }}>
                        {needsServerSearch && !serverResultInUse ? t("chat.searching") : t("chat.noMatchingFiles")}
@@ -1906,23 +2335,27 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
             );
           })()}
           <div
+            className={stackedComposer ? undefined : "chat-composer-row"}
             style={{
               minWidth: 0,
               display: "flex",
+              flexDirection: stackedComposer ? "column" : "row",
               gap: 8,
-              alignItems: "center",
+              alignItems: stackedComposer ? "stretch" : "center",
               background: "var(--bg)",
-              border: `1px solid ${bashMode ? "var(--tool-bg)" : isStreaming && (onSteer || onFollowUp)
+              border: compact ? "none" : `1px solid ${bashMode ? "var(--tool-bg)" : isStreaming && (onSteer || onFollowUp)
                 ? "rgba(234,179,8,0.4)"
                 : "color-mix(in srgb, var(--border) 70%, transparent)"}`,
-              borderRadius: 14,
-              padding: "10px 10px 10px 14px",
-              boxShadow: "0 1px 2px rgba(15,23,42,0.04), 0 8px 24px -12px rgba(15,23,42,0.10)",
+              borderRadius: compact ? 0 : 14,
+              padding: compact ? 0 : isMobile ? "6px 6px 6px 12px" : "10px 10px 10px 14px",
+              boxShadow: compact ? "none" : "0 1px 2px rgba(15,23,42,0.04), 0 8px 24px -12px rgba(15,23,42,0.10)",
               transition: "border-color 0.15s, background 0.15s, box-shadow 0.15s",
             } as React.CSSProperties}
           >
           <textarea
             ref={textareaRef}
+            className="chat-input-textarea"
+            aria-label={compact ? t("chat.askInSideChat") : undefined}
             value={value}
             onChange={(e) => {
               valueRef.current = e.target.value;
@@ -1947,14 +2380,16 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
             onInput={handleInput}
             onPaste={handlePaste}
             placeholder={
-              isStreaming && (onSteer || onFollowUp)
+              isCompacting
+                ? t(backend === "codex" ? "chat.compacting" : "chat.compactingPlaceholder")
+                : isStreaming && (onSteer || onFollowUp)
                 ? t("chat.steerPlaceholder")
                 : isStreaming ? t("chat.agentPlaceholder")
                 : t("chat.messagePlaceholder")
             }
             rows={1}
             style={{
-              flex: 1,
+              flex: stackedComposer ? "none" : 1,
               minWidth: 0,
               width: "100%",
               background: "none",
@@ -1962,22 +2397,45 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
               outline: "none",
               resize: "none",
               color: "var(--text)",
-              fontSize: 14,
+              fontSize: "var(--chat-content-font-size, 14px)",
               lineHeight: 1.6,
               fontFamily: "inherit",
-              minHeight: 24,
+              minHeight: compact ? 96 : 24,
               maxHeight: 200,
               overflow: "auto",
             }}
           />
 
           {isStreaming ? (
-            <div style={{ display: "flex", alignItems: "center", gap: 6, flexShrink: 0, alignSelf: "flex-end" }}>
+            <div style={{ display: "flex", alignItems: "stretch", gap: 6, flexShrink: 0, alignSelf: "flex-end" }}>
+              {onSideChat && (
+                <button
+                  type="button"
+                  onClick={sendToSideChat}
+                  disabled={!value.trim() || attachedImages.length > 0}
+                  title={t("chat.sideChatHint")}
+                  aria-label={t("chat.sideChat")}
+                  className={`bg-transparent ${value.trim() && !attachedImages.length ? "cursor-pointer text-text-muted hover:bg-bg-hover hover:text-text" : "cursor-not-allowed text-text-dim"}`}
+                  style={{
+                    width: 38,
+                    display: "grid", placeItems: "center",
+                    padding: 0,
+                    border: "1px solid var(--border)",
+                    borderRadius: 8,
+                    transition: "background 0.12s",
+                  }}
+                >
+                  <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                    <path d="M21 12a8 8 0 0 1-8 8H5.5a2 2 0 0 1-1.4-3.4A8 8 0 1 1 21 12z" /><path d="M13 8.5v7M9.5 12h7" />
+                  </svg>
+                </button>
+              )}
               {onSteer && (
                 <button
                   onClick={() => sendQueued("steer")}
                   disabled={!canQueueStreamingMessage}
-                  title="Interrupt the current run and inject this message now"
+                  title={t("chat.steerHint")}
+                  aria-label={t("chat.steer")}
                   style={{
                     display: "flex", alignItems: "center", gap: 5,
                     padding: "7px 12px",
@@ -1993,14 +2451,16 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
                   <svg width="12" height="12" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
                     <path d="M5 1 L9 5 L5 9" /><line x1="1" y1="5" x2="9" y2="5" />
                   </svg>
-                  {t("chat.steer")}
+                  <span className="chat-composer-run-label">{t("chat.steer")}</span>
                 </button>
               )}
               {onFollowUp && (
                 <button
                   onClick={() => sendQueued("followup")}
                   disabled={!canQueueStreamingMessage}
-                  title="Queue this message after the agent finishes"
+                  title={`${t("chat.followUpHint")} (${isMobile ? "Ctrl/Cmd+" : ""}Alt/Option+Enter)`}
+                  aria-label={t("chat.followUp")}
+                  aria-keyshortcuts={isMobile ? "Control+Alt+Enter Meta+Alt+Enter" : "Alt+Enter"}
                   style={{
                     display: "flex", alignItems: "center", gap: 5,
                     padding: "7px 12px",
@@ -2017,7 +2477,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
                     <line x1="5" y1="1" x2="5" y2="6" /><polyline points="2.5 3.5 5 1 7.5 3.5" />
                     <line x1="2" y1="9" x2="8" y2="9" />
                   </svg>
-                  {t("chat.followUp")}
+                  <span className="chat-composer-run-label">{t("chat.followUp")}</span>
                 </button>
               )}
             </div>
@@ -2025,20 +2485,23 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
             <button
               onClick={handleSend}
               disabled={!value.trim() && !attachedImages.length}
+              title={t("chat.send")}
+              aria-label={t("chat.send")}
               style={{
                 flexShrink: 0,
                 alignSelf: "flex-end",
-                display: "flex", alignItems: "center", gap: 6,
-                padding: "7px 14px",
+                display: "flex", alignItems: "center", justifyContent: "center", gap: 6,
+                // Mobile: icon-only so the placeholder and draft keep the width.
+                ...(isMobile ? { width: 36, height: 36, padding: 0 } : { padding: "7px 14px" }),
                 background: (value.trim() || attachedImages.length) ? "var(--accent)" : "var(--bg-panel)",
                 border: "none",
                 borderRadius: 8,
-                color: (value.trim() || attachedImages.length) ? "#fff" : "var(--text-dim)",
+                color: (value.trim() || attachedImages.length) ? "var(--accent-contrast)" : "var(--text-dim)",
                 cursor: (value.trim() || attachedImages.length) ? "pointer" : "not-allowed",
                 fontSize: 13,
                 fontWeight: 600,
                 letterSpacing: "-0.01em",
-                boxShadow: (value.trim() || attachedImages.length) ? "0 1px 3px rgba(37,99,235,0.25)" : "none",
+                boxShadow: (value.trim() || attachedImages.length) ? "0 1px 3px color-mix(in srgb, var(--accent) 25%, transparent)" : "none",
                 transition: "background 0.15s, box-shadow 0.15s",
               }}
             >
@@ -2046,7 +2509,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
                 <line x1="2" y1="7" x2="11" y2="7" />
                 <polyline points="7.5 3 12 7 7.5 11" />
               </svg>
-              {t("chat.send")}
+              {!isMobile && t("chat.send")}
             </button>
           )}
           </div>
@@ -2059,9 +2522,16 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
           </div>
         )}
 
+        {!compact && backendsError && (
+          <div role="alert" style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, marginTop: 6, padding: "6px 8px", borderRadius: 8, background: "rgba(239,68,68,0.08)", color: "#dc2626", fontSize: 11 }}>
+            <span>{t("chat.backendDiscoveryFailed")}: {backendsError}</span>
+            {onRetryBackends && <button type="button" onClick={onRetryBackends} style={{ border: "1px solid currentColor", borderRadius: 6, background: "transparent", color: "inherit", padding: "3px 7px", cursor: "pointer" }}>{t("chat.retry")}</button>}
+          </div>
+        )}
+
         {/* Bottom bar: left | center (context) | right */}
-        <div style={{
-          marginTop: 8,
+        {!compact && <div className="chat-input-controls" style={{
+          marginTop: isMobile ? 4 : 8,
           display: isMobile ? "grid" : "flex",
           gridTemplateColumns: isMobile ? "minmax(0, 1fr) auto" : undefined,
           alignItems: "center",
@@ -2072,10 +2542,10 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
           <div style={{ flex: isMobile ? "1 1 auto" : "0 0 auto", minWidth: 0, display: "flex", alignItems: "center", gap: 2 }}>
             <button
               onClick={() => fileInputRef.current?.click()}
-             title={t("chat.attachImage")}
+             title={t("chat.attachFiles")}
               style={{
                 flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center",
-                width: 32, height: 32, padding: 0,
+                width: controlSize, height: controlSize, padding: 0,
                 background: "none", border: "none",
                 borderRadius: 9,
                 color: attachedImages.length ? "var(--accent)" : "var(--text-muted)",
@@ -2092,21 +2562,53 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
                 e.currentTarget.style.color = attachedImages.length ? "var(--accent)" : "var(--text-muted)";
               }}
             >
-              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+              <svg width={isMobile ? 18 : 15} height={isMobile ? 18 : 15} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
                 <rect x="3" y="3" width="18" height="18" rx="2" ry="2" />
                 <circle cx="8.5" cy="8.5" r="1.5" />
                 <polyline points="21 15 16 10 5 21" />
               </svg>
             </button>
-            {/* Model selector - visible always, disabled while the session or switch is busy */}
+            {onBackendChange ? (
+              <select
+                value={backendHandoff && backendChanging && handoffTargetBackend ? handoffTargetBackend : backend}
+                onChange={(event) => {
+                  const value = event.currentTarget.value;
+                  if (value === "pi" || value === "claude" || value === "codex") onBackendChange(value);
+                }}
+                disabled={isStreaming || backendsLoading || backendChanging}
+                aria-busy={backendChanging || undefined}
+                aria-label={t("chat.backend")}
+                title={backendHandoff ? t("chat.backendHandoff") : backends?.[backend]?.reason ?? t("chat.backend")}
+                style={{ height: 32, maxWidth: 112, border: "none", borderRadius: 9, background: "var(--bg-hover)", color: "var(--text)", padding: "0 8px", fontSize: 12 }}
+              >
+                <option value="pi" disabled={backends?.pi.available === false || (backendHandoff && !isHandoffEdge(backend, "pi"))}>Pi</option>
+                <option value="claude" disabled={backends?.claude.available === false || (backendHandoff && !isHandoffEdge(backend, "claude"))}>Claude</option>
+                <option value="codex" disabled={backends?.codex?.available !== true || (backendHandoff && !isHandoffEdge(backend, "codex"))}>Codex</option>
+              </select>
+            ) : (
+              <span title={t("chat.backendLocked")} style={{ padding: "0 6px", color: "var(--text-muted)", fontSize: 11, whiteSpace: "nowrap" }}>
+                {backend === "claude" ? "Claude" : backend === "codex" ? "Codex" : "Pi"}
+              </span>
+            )}
+            {backend === "claude" && !onModelChange && (
+              <span title={t("chat.nativeModelHelp")} style={{ maxWidth: 220, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--text-muted)", fontSize: 11 }}>
+                {effectiveNativeModel ?? t("chat.nativeModelUnresolved")}
+              </span>
+            )}
             {(modelOptions.length > 0 || model || modelError) && onModelChange && (
               <ModelSelector
                 options={modelOptions}
                 value={model}
+                onOpen={onLoadModels}
                 onChange={onModelChange}
-                disabled={isStreaming}
+                onReselect={onModelChange}
+                ariaLabel={t("chat.changeModel")}
                 busy={modelSwitching}
                 isAutoSelection={isAutoModelSelection}
+                defaultValue={defaultModel}
+                onSetDefault={onSetDefaultModel}
+                allOptions={allModelList?.map((m) => ({ provider: m.provider, providerName: m.providerName, modelId: m.id, name: m.name }))}
+                onShowAll={onLoadAllModels}
               />
             )}
           </div>
@@ -2139,7 +2641,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
                   alignItems: "center",
                   justifyContent: "center",
                   width: "100%",
-                  height: 32,
+                  height: controlSize,
                   padding: "8px 10px",
                   background: "none",
                   border: "none",
@@ -2187,29 +2689,38 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
                 backdropFilter: "blur(10px)",
               } : null),
             }}>
-            {!isStreaming && onThinkingLevelChange && (
-              <div ref={thinkingDropdownRef} style={{ position: "relative" }}>
+            {reasoning && (
+              <div ref={thinkingDropdownRef} style={{ position: isMobile ? "static" : "relative" }}>
                 <button
-                  onClick={() => !isStreaming && setThinkingDropdownOpen((v) => !v)}
-                  disabled={isStreaming}
-                   title={t("chat.changeReasoning", { level: thinkingDisplayLabel })}
-                   aria-label={t("chat.changeReasoningLabel")}
+                  disabled={reasoning.disabled || reasoning.busy}
+                  aria-haspopup="listbox"
+                  aria-expanded={thinkingDropdownOpen}
+                  onKeyDown={(event) => {
+                    if (event.key === "Escape" && thinkingDropdownOpen) {
+                      event.preventDefault();
+                      event.stopPropagation();
+                      setThinkingDropdownOpen(false);
+                    }
+                  }}
+                  onClick={() => setThinkingDropdownOpen((v) => !v)}
+                  title={isStreaming
+                    ? t("chat.currentReasoning", { level: thinkingDisplayLabel })
+                    : t("chat.changeReasoning", { level: thinkingDisplayLabel })}
+                  aria-label={t("chat.changeReasoningLabel")}
                   style={{
                     display: "flex", alignItems: "center", justifyContent: "center", gap: 5,
-                    padding: isMobile ? "0 6px" : "8px 12px",
+                    padding: isMobile ? "0 10px" : "8px 12px",
                     width: isMobile ? "auto" : undefined,
-                    height: 32,
+                    height: controlSize,
                     background: thinkingDropdownOpen ? "var(--bg-hover)" : "none",
                     border: "none",
                     borderRadius: 9,
                     color: "var(--text-muted)",
-                    cursor: isStreaming ? "not-allowed" : "pointer",
+                    cursor: "pointer",
                     fontSize: 12,
-                    opacity: isStreaming ? 0.5 : 1,
                     transition: "background 0.12s, color 0.12s",
                   }}
                   onMouseEnter={(e) => {
-                    if (isStreaming) return;
                     e.currentTarget.style.background = "var(--bg-hover)";
                     e.currentTarget.style.color = "var(--text)";
                   }}
@@ -2226,67 +2737,58 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
                   {(!isMobile || controlsMenuOpen) && <span style={{ whiteSpace: "nowrap" }}>{thinkingDisplayLabel}</span>}
                 </button>
                 {thinkingDropdownOpen && (
-                  <div style={{
-                    position: "absolute", bottom: "calc(100% + 6px)",
-                    ...(isMobile ? { left: 0 } : { right: 0 }),
+                  <div role="listbox" aria-label={t("chat.changeReasoning", { level: thinkingDisplayLabel })} onKeyDown={(event) => {
+                    if (event.key === "Escape") {
+                      event.preventDefault();
+                      event.stopPropagation();
+                      setThinkingDropdownOpen(false);
+                      thinkingDropdownRef.current?.querySelector("button")?.focus();
+                    }
+                  }} style={{
+                    position: "absolute", bottom: "calc(100% + 6px)", right: 0,
                     zIndex: 100, background: "var(--bg)", border: "1px solid var(--border)",
                     borderRadius: 8, boxShadow: "0 -4px 16px rgba(0,0,0,0.10)",
-                    overflow: "hidden", minWidth: 180,
+                    overflow: "auto", minWidth: 180, maxWidth: "calc(100vw - 32px)", maxHeight: "50vh",
                   }}>
-                    {THINKING_LEVELS.filter((lvl) => {
-                      if (!availableThinkingLevels) return true;
-                      if (lvl === "auto") return true;
-                      return availableThinkingLevels.includes(lvl);
-                    }).map((lvl) => {
-                      const isActive = (thinkingLevel ?? "auto") === lvl;
-                       const desc = t(THINKING_LEVEL_DESC_KEYS[lvl]);
-                      const mappedVal = (lvl !== "auto" && thinkingLevelMap) ? thinkingLevelMap[lvl] : undefined;
-                      const displayLabel = (mappedVal != null && mappedVal !== lvl) ? mappedVal : lvl;
-                      const showOriginal = mappedVal != null && mappedVal !== lvl;
-                      return (
-                        <button
-                          key={lvl}
-                          onClick={() => { setThinkingDropdownOpen(false); if (!isActive) onThinkingLevelChange(lvl); }}
-                          style={{
-                            display: "flex", alignItems: "center", gap: 8,
-                            width: "100%", padding: "7px 12px",
-                            background: isActive ? "var(--bg-selected)" : "none",
-                            border: "none",
-                            color: isActive ? "var(--text)" : "var(--text-muted)",
-                            cursor: "pointer", fontSize: 12, textAlign: "left",
-                            fontWeight: isActive ? 600 : 400,
-                            whiteSpace: "nowrap",
-                          }}
-                          onMouseEnter={(e) => { if (!isActive) e.currentTarget.style.background = "var(--bg-hover)"; }}
-                          onMouseLeave={(e) => { if (!isActive) e.currentTarget.style.background = "none"; }}
-                        >
-                          {isActive
-                            ? <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="var(--accent)" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0 }}><polyline points="1.5 5 4 7.5 8.5 2.5" /></svg>
-                            : <span style={{ width: 10, flexShrink: 0 }} />}
-                          <span style={{ flex: 1 }}>
-                            {displayLabel}
-                            {showOriginal && <span style={{ fontSize: 10, color: "var(--text-dim)", fontFamily: "var(--font-mono)", marginLeft: 5 }}>({lvl})</span>}
-                          </span>
-                          <span style={{ fontSize: 11, color: "var(--text-dim)", marginLeft: 8 }}>{desc}</span>
-                        </button>
-                      );
-                    })}
+                    {reasoning.rows.map(row => (
+                      <SelectorRow
+                        key={row.key}
+                        active={row.selected}
+                        onSelect={() => {
+                          setThinkingDropdownOpen(false);
+                          if (!reasoning.disabled && !reasoning.busy && !row.selected) reasoning.onChange(row.choice);
+                        }}
+                        gutter={reasoning.rows.some(option => Boolean(option.star))}
+                        star={row.star ? { ...row.star, onSave: () => { setThinkingDropdownOpen(false); row.star?.onSave(); } } : undefined}
+                      >
+                        <span style={{ flex: 1 }}>
+                          {row.label}
+                          {row.originalLabel && <span style={{ fontSize: 10, color: "var(--text-dim)", fontFamily: "var(--font-mono)", marginLeft: 5 }}>({row.originalLabel})</span>}
+                        </span>
+                        <span style={{ fontSize: 11, color: "var(--text-dim)", marginLeft: 8, whiteSpace: "normal" }}>{row.description}</span>
+                      </SelectorRow>
+                    ))}
                   </div>
                 )}
               </div>
             )}
             {!isStreaming && onToolPresetChange && (
-              <div ref={toolDropdownRef} style={{ position: "relative" }}>
+              <div ref={toolDropdownRef} style={{
+                // On a phone the menu opens from the strip's right edge, not
+                // the button's: its preset descriptions are wider than the room
+                // right of the button, so it ran off the screen.
+                position: isMobile ? "static" : "relative",
+              }}>
                 <button
-                  onClick={() => !isStreaming && setToolDropdownOpen((v) => !v)}
+                  onClick={(e) => { if (!isStreaming && !isStrayClick(e)) setToolDropdownOpen((v) => !v); }}
                   disabled={isStreaming}
                   title={t("chat.changeToolPreset") + `: ${toolPresetLabel}`}
                   aria-label={t("chat.changeToolPreset")}
                   style={{
                     display: "flex", alignItems: "center", justifyContent: "center", gap: 5,
-                    padding: isMobile ? "0 6px" : "8px 12px",
+                    padding: isMobile ? "0 10px" : "8px 12px",
                     width: isMobile ? "auto" : undefined,
-                    height: 32,
+                    height: controlSize,
                     background: toolDropdownOpen ? "var(--bg-hover)" : "none",
                     border: "none",
                     borderRadius: 9,
@@ -2315,17 +2817,18 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
                   <div style={{
                     position: "absolute",
                     bottom: "calc(100% + 6px)",
-                    right: isMobile ? undefined : 0,
-                    left: isMobile ? 0 : undefined,
+                    right: 0,
+                    maxWidth: isMobile ? "calc(100vw - 16px)" : undefined,
                     zIndex: 100, background: "var(--bg)", border: "1px solid var(--border)",
                     borderRadius: 8, boxShadow: "0 -4px 16px rgba(0,0,0,0.10)",
                     overflow: "hidden", minWidth: 120,
                   }}>
                     {TOOL_PRESETS.map((lvl) => {
                       const preset = TOOL_PRESET_MAP[lvl];
-                      const isActive = (toolPreset ?? "default") === preset;
+                      const isActive = (toolPreset ?? "configured") === preset;
                       let desc: string;
-                      if (lvl === "chat-only") desc = t("chat.chatOnly");
+                      if (lvl === "configured") desc = t("chat.configuredTools");
+                      else if (lvl === "chat-only") desc = t("chat.chatOnly");
                       else if (lvl === "read-only") desc = t("chat.readOnlyTools", { count: 4 });
                       else if (lvl === "default") desc = t("chat.builtInTools", { count: 4 });
                       else desc = t("chat.allBuiltInTools");
@@ -2359,26 +2862,26 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
               </div>
             )}
 
-            {!isStreaming && onCompact && (
+            {(!isStreaming || isCompacting) && onCompact && (
               <div>
                 <button
-                  onClick={isCompacting ? onAbortCompaction : onCompact}
-                  disabled={isStreaming && !isCompacting}
+                  disabled={isCompacting && !onAbortCompaction}
+                  aria-busy={isCompacting || undefined}
+                  onClick={isCompacting ? onAbortCompaction : (e) => { if (!isStrayClick(e)) onCompact(); }}
                   style={{
                     display: "flex", alignItems: "center", justifyContent: "center", gap: 5,
-                    padding: isMobile ? "0 6px" : "8px 12px",
+                    padding: isMobile ? "0 10px" : "8px 12px",
                     width: isMobile ? "auto" : undefined,
-                    height: 32,
+                    height: controlSize,
                     background: isCompacting ? "rgba(239,68,68,0.08)" : "none",
                     border: "none",
                     borderRadius: 9,
                     color: isCompacting ? "#ef4444" : "var(--text-muted)",
-                    cursor: (isStreaming && !isCompacting) ? "not-allowed" : "pointer",
-                    fontSize: 12, opacity: (isStreaming && !isCompacting) ? 0.5 : 1,
+                    cursor: "pointer",
+                    fontSize: 12,
                     transition: "background 0.12s, color 0.12s",
                   }}
                   onMouseEnter={(e) => {
-                    if (isStreaming && !isCompacting) return;
                     e.currentTarget.style.background = isCompacting ? "rgba(239,68,68,0.16)" : "var(--bg-hover)";
                     e.currentTarget.style.color = isCompacting ? "#ef4444" : "var(--text)";
                   }}
@@ -2386,11 +2889,11 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
                     e.currentTarget.style.background = isCompacting ? "rgba(239,68,68,0.08)" : "none";
                     e.currentTarget.style.color = isCompacting ? "#ef4444" : "var(--text-muted)";
                   }}
-                   title={isCompacting ? t("chat.stopCompaction") : t("chat.compactContext")}
-                   aria-label={isCompacting ? t("chat.stopCompaction") : t("chat.compactContext")}
+                   title={isCompacting ? t(onAbortCompaction ? "chat.stopCompaction" : "chat.compacting") : t("chat.compactContext")}
+                   aria-label={isCompacting ? t(onAbortCompaction ? "chat.stopCompaction" : "chat.compacting") : t("chat.compactContext")}
                 >
                   {isCompacting ? (
-                    <><svg width="10" height="10" viewBox="0 0 10 10" fill="none"><rect x="2" y="2" width="6" height="6" rx="1" fill="currentColor" /></svg>{(!isMobile || controlsMenuOpen) && <span style={{ whiteSpace: "nowrap" }}>{t("chat.compacting")}</span>}</>
+                    <>{onAbortCompaction ? <svg width="10" height="10" viewBox="0 0 10 10" fill="none"><rect x="2" y="2" width="6" height="6" rx="1" fill="currentColor" /></svg> : <span aria-hidden="true">…</span>}{(!isMobile || controlsMenuOpen) && <span style={{ whiteSpace: "nowrap" }}>{t("chat.compacting")}</span>}</>
                   ) : (
                     <><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                       <polyline points="4 14 10 14 10 20" /><polyline points="20 10 14 10 14 4" />
@@ -2408,7 +2911,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
                 style={{
                   display: "flex", alignItems: "center", gap: 6,
                   padding: "8px 14px",
-                  height: 32,
+                  height: controlSize,
                   background: "rgba(239,68,68,0.08)",
                   border: "1px solid rgba(239,68,68,0.3)",
                   borderRadius: 9,
@@ -2435,8 +2938,8 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
                  aria-label={soundEnabled ? t("chat.disableSound") : t("chat.enableSound")}
                 style={{
                   display: "flex", alignItems: "center", justifyContent: "center", gap: 5,
-                  width: isMobile ? 32 : 32,
-                  height: 32,
+                  width: controlSize,
+                  height: controlSize,
                   padding: 0,
                   background: "none",
                   border: "none",
@@ -2487,8 +2990,8 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
                   display: "flex",
                   alignItems: "center",
                   justifyContent: "center",
-                  width: 36,
-                  height: 32,
+                  width: isMobile ? controlSize : 36,
+                  height: controlSize,
                   padding: 0,
                   marginLeft: 0,
                   background: "var(--bg-hover)",
@@ -2515,8 +3018,8 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
             </div>
           </div>
 
-        </div>
+        </div>}
       </div>
-    </div>
+    </fieldset>
   );
-});
+}));
