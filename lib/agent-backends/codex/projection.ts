@@ -6,7 +6,7 @@ import { codexWebSessionId } from "./identity";
 import { firstCodexUserText } from "./user-envelope";
 
 export const CODEX_CAPABILITIES: Readonly<AgentBackendCapabilities> = Object.freeze({
-  backend: "codex", history: true, prompt: true, stop: true, followUp: false, steer: true,
+  backend: "codex", history: true, prompt: true, stop: true, followUp: true, steer: true,
   fork: true, treeBranch: false, export: false, compact: true, mcp: true, skills: true, side: false,
   toolPresets: false, forkAtEntry: false, sideChat: false, rename: false, delete: false,
   tools: false, commands: false, models: true, setModel: true, effort: true,

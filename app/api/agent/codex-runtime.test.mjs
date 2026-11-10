@@ -12,7 +12,7 @@ await isolatePiHome();
 process.env.PI_WEB_CODEX = '1';
 const jiti = createJiti(import.meta.url, { tsconfigPaths: true });
 const { runCodexMutationOnce } = await jiti.import('../../../lib/agent-backends/codex/mutation-journal.ts');
-const { createCodexSession, getCodexSession, shutdownCodexSession } = await jiti.import('../../../lib/agent-backends/codex.ts');
+const { createCodexSession, getCodexSession, shutdownCodexSession, codexSessionState } = await jiti.import('../../../lib/agent-backends/codex.ts');
 const { getAllowedFileRoots, isExistingFilePathAllowed } = await jiti.import('../../../lib/file-access.ts');
 const eventsRoute = await jiti.import('./[id]/events/route.ts');
 const historyRoute = await jiti.import('../sessions/[id]/route.ts');
@@ -122,7 +122,7 @@ readline.createInterface({ input: process.stdin }).on('line', line => { const q 
   }
 });
 
-test('the command route sends steer once and refuses a concurrent different steer', async () => {
+test('the command route queues distinct steers and deduplicates the same request', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'codex-steer-route-'));
   const binary = join(dir, 'codex');
   const log = join(dir, 'requests');
@@ -154,10 +154,10 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
     const first = commandRoute.POST(post(input), context);
     const joined = commandRoute.POST(post(input), context);
     const busy = await commandRoute.POST(post({ ...input, requestId: uuid(33), message: 'different' }), context);
-    assert.equal(busy.status, 409);
+    assert.equal(busy.status, 200);
     assert.equal((await first).status, 200);
     assert.equal((await joined).status, 200);
-    assert.equal((await readFile(log, 'utf8')).split('\n').filter(method => method === 'turn/steer').length, 1);
+    assert.deepEqual(codexSessionState(actor).queuedMessages.steering, ['steer', 'different']);
   } finally {
     if (actor) await shutdownCodexSession(actor);
     await rm(dir, { recursive: true, force: true });

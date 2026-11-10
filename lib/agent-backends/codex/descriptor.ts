@@ -17,7 +17,7 @@ export async function describeCodex(options: { binary?: string; env?: NodeJS.Pro
     }
   }
   const available = reason === "";
-  const supported = new Set<Capability>(["history", "prompt", "stop", "steer", "questions", "models", "setModel", "effort", "skills", "mcp", "fork", "compact"]);
+  const supported = new Set<Capability>(["history", "prompt", "stop", "steer", "followUp", "questions", "models", "setModel", "effort", "skills", "mcp", "fork", "compact"]);
   const capabilities = Object.fromEntries(capabilityNames.map((name) => [name, available && supported.has(name)])) as Record<Capability, boolean>;
   return {
     id: "codex",

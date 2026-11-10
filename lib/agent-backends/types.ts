@@ -67,7 +67,7 @@ export const CLAUDE_CAPABILITIES: Readonly<AgentBackendCapabilities> = Object.fr
   prompt: true,
   stop: true,
   followUp: true,
-  steer: false,
+  steer: true,
   fork: true,
   treeBranch: false,
   export: true,

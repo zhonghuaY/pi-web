@@ -4,7 +4,7 @@ Choose **Pi** or **Claude** in a new conversation. Each native session keeps tha
 
 ## Native configuration
 
-Install a compatible Claude Code executable and authenticate it using your normal local setup. The verified combination is Claude Code 2.1.318 and `@anthropic-ai/claude-agent-sdk` 0.3.318. Pi Web uses the executable on the server PATH, or an absolute `PI_WEB_CLAUDE_EXECUTABLE` path. No credentials are copied into Pi settings.
+Install a compatible Claude Code executable and authenticate it using your normal local setup. Claude Code 2.1.319 and 2.1.321 have been verified with `@anthropic-ai/claude-agent-sdk` 0.3.318. Pi Web uses the executable on the server PATH, or an absolute `PI_WEB_CLAUDE_EXECUTABLE` path. No credentials are copied into Pi settings.
 
 The native Claude setting supplies the initial model. The model picker reads the complete catalogue from the SDK’s `supportedModels()` result, which already applies Claude Code aliases, `modelPicker`, gateway discovery, `modelOverrides`, managed allowlists, and custom model options. Claude Code does not define a separate `~/.claude/models.json` contract; Pi Web does not parse third-party files that may use that name or expose their credentials. The composer can override the selected model and its native supported effort level for the current Claude session through the SDK’s `setModel` and flag-settings APIs; these are not Pi provider or thinking settings. Pi tool presets are never passed to Claude. Settings shows the user, project and local Claude settings files. Native MCP, skills, agents, hooks and plugins follow Claude discovery rules.
 
@@ -12,7 +12,9 @@ Before the first prompt or project-resource discovery in a runtime, confirm proj
 
 ## Conversations and tools
 
-Native terminal history appears beside Pi history. Claude session URLs use `claude:<uuid>`; existing Pi URLs remain valid. Replies, thinking, images, tool cards, permission requests and question dialogs use the shared chat UI. Permission answers are single-use and reconciled when a page reconnects. Stop also cancels pending input and startup.
+Native terminal history appears beside Pi history. Claude session URLs use `claude:<uuid>`; existing Pi URLs remain valid. Replies, thinking, images, tool cards, permission requests and question dialogs use the shared chat UI. Permission answers are single-use and reconciled when a page reconnects. Stop cancels pending interactions and startup. Follow-ups wait in the Web session until the current run finishes. Native sessions read Pi's `steeringMode` and `followUpMode`: `one-at-a-time` delivers one queued message, while `all` delivers the selected queue to one model continuation. Each message keeps its own history entry. Stop keeps undelivered text and images for the next run or Recall. The queue stays in the Web session if an idle Claude runtime is released. If a forced stop closes the native process, pending messages return to the composer.
+
+Steers wait in the Web session until Claude reaches the end of a response or a tool batch. Delivery requires the runtime to advertise interrupt receipts and queued-message cancellation; otherwise the steer stays available for Recall. Stop waits for an in-flight input write before cancelling it. If delivery cannot be confirmed, the message is retained or returned to the composer with a notice, and is not automatically retried.
 
 Use the sidebar **Fork** action for an independent native copy. `/side` opens a side conversation with inherited history and a persistent no-tool policy: tools, MCP and hooks are disabled. A side conversation cannot widen its policy. Native subagents have a read-only history viewer under their parent; they are not independently controllable Pi agents.
 

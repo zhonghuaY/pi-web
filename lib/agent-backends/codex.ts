@@ -10,7 +10,9 @@ import type { AgentInteractionRequest } from "./types";
 import { CodexTransportError, startCodexTransport, type CodexTransport } from "./codex/internal/transport";
 import { runCodexMutationOnce } from "./codex/mutation-journal";
 import { codexWebSessionId, nativeCodexSessionId } from "./codex/identity";
-import { assembleCodexReasoning, projectItem } from "./codex/history";
+import { assembleCodexReasoning, projectItem, projectUserItems } from "./codex/history";
+import { codexBatchInput, type CodexQueuedText } from "./codex/batch";
+import { readPiQueueModes, type QueueModes } from "./queue-modes";
 import type { CodexThread } from "./codex/catalogue";
 import { parseCodexModels, type CodexModelChoice, type CodexEffectiveSettings, type CodexSelection } from "@/lib/agent-session-choices";
 import { CODEX_CAPABILITIES, projectCodexSessionInfo } from "./codex/projection";
@@ -38,7 +40,8 @@ type TurnEnd = { kind: "completed" | "interrupted" | "failed" | "stopped" | "tra
 type Waiter = (result: TurnEnd) => void;
 type ItemBuffer = { id: ItemId; kind: "reasoning" | "agentMessage"; text: string; segments: Map<string, { kind: "summary" | "text"; index: number; text: string }> | null; completed: boolean; started: boolean };
 type ActivityBuffer = { id: ItemId; kind: "activity"; nativeType: string; toolName: string; message: AgentMessage; completed: boolean; started: boolean };
-type LiveItem = ItemBuffer | ActivityBuffer;
+type UserBuffer = { id: ItemId; kind: "user"; message: AgentMessage; completed: boolean; started: boolean };
+type LiveItem = ItemBuffer | ActivityBuffer | UserBuffer;
 type NativeMethod = "turn/started" | "turn/completed" | "item/started" | "item/completed" | "item/agentMessage/delta" | "item/reasoning/textDelta" | "item/reasoning/summaryTextDelta" | "item/commandExecution/outputDelta" | "item/mcpToolCall/progress" | "error";
 type ValidatedNativeMethod = Exclude<NativeMethod, "item/commandExecution/outputDelta" | "item/mcpToolCall/progress">;
 type NativeNotification = { [M in ValidatedNativeMethod]: { method: M; params: CodexPayloads[M] } }[ValidatedNativeMethod]
@@ -52,10 +55,13 @@ type ActorState = { kind: "opening"; transport: CodexTransport | null } | { kind
 type SessionEvent = AgentEvent;
 export type Actor = { readonly sessionId: WebId; readonly cwd: string; state: ActorState; listeners: Set<(event: SessionEvent) => void> };
 type CreateInput = { cwd: string; requestId: RequestId; model?: string; effort?: string };
-type PromptInput = { requestId: RequestId; message: string };
-type ActorOptions = { binary?: string; env?: NodeJS.ProcessEnv; requestTimeoutMs?: number };
+type PromptInput = { requestId: RequestId; message: string; batch?: readonly CodexQueuedText[] };
+type StreamBehavior = "steer" | "followUp";
+type StreamingReceipt = { digest: string; promise: Promise<Result<{ queued: boolean; turnId?: TurnId }>> };
+type QueuedSteer = { input: PromptInput; status: "queued" | "sent" | "blocked" | "unknown" };
+type ActorOptions = { binary?: string; env?: NodeJS.ProcessEnv; requestTimeoutMs?: number; queueModes?: QueueModes };
 type PromptAccepted = { kind: "live"; turnId: TurnId; completion: Promise<TurnEnd> } | { kind: "replayed"; turnId: TurnId };
-type StopResult = { stopped: boolean; completion: TurnEnd | null };
+type StopResult = { stopped: boolean; completion: TurnEnd | null; steering?: string[]; followUp?: string[] };
 type CodexAdmission = { captures: Set<WebId>; mutations: Map<WebId, number>; deferred: Map<WebId, Array<() => void>> };
 type Registry = { actors: Map<WebId, Actor>; ensuring: Map<WebId, Promise<Result<Actor>>>; admission: CodexAdmission; installed: boolean };
 type SteerState = { kind: "pending"; turnId: TurnId; requestId: RequestId; digest: string; promise: Promise<Result<{ turnId: TurnId }>> } | { kind: "ambiguous"; turnId: TurnId };
@@ -63,7 +69,7 @@ type InteractionMethod = "item/commandExecution/requestApproval" | "item/fileCha
 type InteractionGroup = { method: InteractionMethod; turnId: string; requests: Map<string, { event: AgentInteractionRequest; questionId?: string }>; answers: Record<string, { answers: string[] }>; cancelAllowed: boolean; resolve: (value: unknown) => void; signal: AbortSignal; onAbort: () => void; announced: boolean };
 type SettingsPending = { sent: boolean; transport: CodexTransport; resolve: (settings: CodexEffectiveSettings | null) => void };
 type Operation = { kind: "fork" } | { kind: "compact"; progress: CompactionProgress };
-type ActorExtra = { options: ActorOptions; operation?: Operation; settings: CodexEffectiveSettings; settingsPending?: SettingsPending; settingsUncertain?: boolean; requestTimeoutMs: number; thread: CodexThread; timer?: ReturnType<typeof setTimeout>; idleTimer?: ReturnType<typeof setTimeout>; work?: number; active?: { requestId: RequestId; digest: string; promise: Promise<Result<PromptAccepted>>; completion: Promise<TurnEnd> }; steer?: SteerState; interactions: Set<InteractionGroup>; shutdown?: Promise<void> };
+type ActorExtra = { options: ActorOptions; queueModes: QueueModes; operation?: Operation; settings: CodexEffectiveSettings; settingsPending?: SettingsPending; settingsUncertain?: boolean; requestTimeoutMs: number; thread: CodexThread; timer?: ReturnType<typeof setTimeout>; idleTimer?: ReturnType<typeof setTimeout>; work?: number; active?: { requestId: RequestId; digest: string; promise: Promise<Result<PromptAccepted>>; completion: Promise<TurnEnd> }; steer?: SteerState; steering: QueuedSteer[]; steerPump?: Promise<void>; followUps: PromptInput[]; streamAdmission: Promise<void>; streamReceipts: Map<RequestId, StreamingReceipt>; interactions: Set<InteractionGroup>; shutdown?: Promise<void> };
 const key = Symbol.for("pi-web.codex-backend.registry");
 const registryRoot = globalThis as Record<symbol, Registry>;
 const registry = registryRoot[key] ??= { actors: new Map(), ensuring: new Map(), admission: { captures: new Set(), mutations: new Map(), deferred: new Map() }, installed: false };
@@ -192,6 +198,10 @@ function validate<K extends CodexPayloadMethod>(method: K, value: unknown): Code
   return result.value;
 }
 function emit(actor: Actor, event: SessionEvent) { for (const listener of actor.listeners) { try { listener(event); } catch { /* listener owns its errors */ } } }
+function queuedMessages(actor: Actor) {
+  return { steering: extras.get(actor)!.steering.map(row => row.input.message), followUp: extras.get(actor)!.followUps.map(input => input.message) };
+}
+function emitQueue(actor: Actor) { emit(actor, { type: "queue_update", ...queuedMessages(actor) }); }
 function finishInteraction(actor: Actor, group: InteractionGroup, result: unknown, reason: "answered" | "cancelled" | "aborted" | "session_closed") {
   if (result !== undefined) {
     if (group.method === "item/tool/requestUserInput") validate("item/tool/requestUserInput:response", result);
@@ -308,6 +318,7 @@ function idleForReaping(actor: Actor): boolean {
   const extra = extras.get(actor);
   return actor.state.kind === "ready" && actor.state.turn.kind === "idle" && actor.listeners.size === 0 && Boolean(extra)
     && !extra!.operation && !extra!.settingsPending && !extra!.active && !extra!.shutdown && !extra!.work
+    && extra!.steering.length === 0 && extra!.followUps.length === 0
     && extra!.interactions.size === 0 && !registry.admission.mutations.get(actor.sessionId);
 }
 function reapIdle(actor: Actor): void {
@@ -370,7 +381,7 @@ function installCleanup() {
   for (const signal of ["SIGINT", "SIGTERM"] as const) process.once(signal, () => { for (const actor of registry.actors.values()) shutdownForProcessExit(actor); });
 }
 function messageFor(actor: Actor, item: LiveItem): AgentMessage {
-  if (item.kind === "activity") return item.message;
+  if (item.kind === "activity" || item.kind === "user") return item.message;
   const thread = extras.get(actor)!.thread;
   return { role: "assistant", provider: thread.modelProvider, model: thread.model ?? "", content: item.kind === "reasoning" ? [{ type: "thinking", thinking: item.text }] : [{ type: "text", text: item.text }] };
 }
@@ -381,7 +392,7 @@ function itemFor(items: Map<ItemId, LiveItem>, rawId: string, kind: ItemBuffer["
   if (!item) { item = { id, kind, text: "", segments: kind === "reasoning" ? new Map() : null, completed: false, started: false }; items.set(id, item); }
   return item.kind === kind ? item : null;
 }
-function startItem(actor: Actor, item: ItemBuffer) { if (!item.started) { item.started = true; emit(actor, { type: "message_start", entryId: item.id, message: messageFor(actor, item) }); } }
+function startItem(actor: Actor, item: ItemBuffer | UserBuffer) { if (!item.started) { item.started = true; emit(actor, { type: "message_start", entryId: item.id, message: messageFor(actor, item) }); } }
 function activityText(message: AgentMessage): string {
   return message.role === "bashExecution" ? message.output : message.role === "custom" && typeof message.content === "string" ? message.content : "";
 }
@@ -438,11 +449,44 @@ function handleNotification(actor: Actor, notification: NativeNotification) {
     const end: TurnEnd = { kind: status === "interrupted" ? "interrupted" : status === "failed" ? "failed" : "completed" };
     if (end.kind === "failed" && notification.method === "turn/completed") emit(actor, { type: "prompt_error", errorMessage: "Codex could not complete the turn." });
     state.turn = { kind: "idle" };
-    extras.get(actor)!.steer = undefined;
+    const extra = extras.get(actor)!;
+    extra.steer = undefined;
     clearHealth(actor);
     settle(turn, end);
     const messages = [...turn.items.values()].map(item => messageFor(actor, item));
     emit(actor, { type: "turn_end", message: messages.at(-1) ?? { role: "assistant", provider: "", model: "", content: [] }, toolResults: [] });
+    const uncertainSteers = extra.steering.filter(row => row.status === "sent");
+    if (uncertainSteers.length) {
+      for (const row of uncertainSteers) row.status = "unknown";
+      emitQueue(actor);
+      emit(actor, { type: "prompt_error", errorMessage: "Codex could not confirm the queued steer. Check the conversation before retrying." });
+    }
+    const mayContinue = end.kind === "completed" && turn.kind !== "stopping";
+    const nextSteer = mayContinue && extra.steering[0]?.status === "queued" ? extra.steering.shift() : undefined;
+    const followUps = !nextSteer && mayContinue && extra.steering.length === 0
+      ? extra.followUps.splice(0, extra.queueModes.followUp === "all" ? extra.followUps.length : 1) : [];
+    const firstFollowUp = followUps[0];
+    const next = nextSteer?.input ?? (firstFollowUp ? { ...firstFollowUp, ...(followUps.length > 1 ? { batch: followUps } : {}) } : undefined);
+    if (next) {
+      const delivery = promptCodexSession(actor, next);
+      emitQueue(actor);
+      void delivery.then(result => {
+        if (result.ok && result.value.kind === "live") return;
+        if (!result.ok && actor.state.kind === "ready") {
+          if (result.error.kind !== "outcome-unknown") {
+            if (nextSteer) extra.steering.unshift(nextSteer);
+            else extra.followUps.unshift(...followUps);
+          }
+          emitQueue(actor);
+          emit(actor, { type: "prompt_error", errorMessage: "Codex could not deliver the queued message." });
+        }
+        if (actor.state.kind === "ready") {
+          emit(actor, { type: "agent_end", messages: [] });
+          emit(actor, { type: "prompt_done", aborted: !result.ok });
+        }
+      });
+      return;
+    }
     emit(actor, { type: "agent_end", messages });
     emit(actor, { type: "prompt_done", ...(end.kind === "interrupted" ? { aborted: true } : {}) });
     return;
@@ -470,6 +514,28 @@ function handleNotification(actor: Actor, notification: NativeNotification) {
   }
   if (notification.method === "item/started" || notification.method === "item/completed") {
     const native = notification.params.item;
+    if (native.type === "userMessage") {
+      if (!validNativeId(native.id)) return;
+      const extra = extras.get(actor)!;
+      for (const entry of projectUserItems(native, extra.thread)) {
+        const id = entry.id as ItemId;
+        let item = turn.items.get(id);
+        if (item && item.kind !== "user") { fatal(actor); return; }
+        if (!item) {
+          item = { id, kind: "user", message: entry.message, completed: false, started: false };
+          turn.items.set(id, item);
+        }
+        if (item.kind !== "user" || item.completed) continue;
+        if (notification.method === "item/completed") finishItem(actor, item);
+        else startItem(actor, item);
+      }
+      if (typeof native.clientId === "string") {
+        const index = extra.steering.findIndex(row => row.status === "sent" && row.input.requestId === native.clientId);
+        if (index >= 0) { extra.steering.splice(index, 1); emitQueue(actor); }
+      }
+      pumpCodexSteering(actor);
+      return;
+    }
     if (["commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall"].includes(native.type)) {
       if (!validNativeId(native.id)) return;
       const id = native.id as ItemId;
@@ -579,7 +645,7 @@ function scheduleHealth(actor: Actor) {
 function actorFor(thread: CodexThread, transport: CodexTransport, settings: CodexEffectiveSettings, options: ActorOptions): Actor {
   const sessionId = codexWebSessionId(thread.id) as WebId;
   const actor: Actor = { sessionId, cwd: thread.cwd, state: { kind: "ready", transport, threadId: thread.id as ThreadId, turn: { kind: "idle" } }, listeners: new Set() };
-  extras.set(actor, { options, thread: { ...thread, model: settings.model, modelProvider: settings.modelProvider }, settings, requestTimeoutMs: options.requestTimeoutMs ?? 10000, interactions: new Set() });
+  extras.set(actor, { options, queueModes: options.queueModes ?? readPiQueueModes(thread.cwd), thread: { ...thread, model: settings.model, modelProvider: settings.modelProvider }, settings, requestTimeoutMs: options.requestTimeoutMs ?? 10000, steering: [], followUps: [], streamAdmission: Promise.resolve(), streamReceipts: new Map(), interactions: new Set() });
   installCleanup();
   return actor;
 }
@@ -928,13 +994,17 @@ async function promptCodexSessionImpl(actor: Actor, input: PromptInput, kind: "p
   const extra = extras.get(actor)!;
   if (extra.settingsPending || extra.operation) return fail(generic("conflict", "Codex session is busy"));
   if (extra.settingsUncertain) return fail({ kind: "outcome-unknown", operation: "settings" });
-  const requestDigest = digest([kind === "prompt" ? "codex-prompt-v1" : "codex-handoff-prompt-v1", actor.sessionId, input.message]);
+  const requestDigest = digest([kind === "prompt" ? "codex-prompt-v1" : "codex-handoff-prompt-v1", actor.sessionId, input.message,
+    ...(input.batch ? [input.batch] : [])]);
   if (state.turn.kind !== "idle") {
     if (extra.active?.requestId === input.requestId && extra.active.digest === requestDigest) return extra.active.promise;
     return fail(generic("conflict", "Codex session is busy"));
   }
-  const params = { threadId: state.threadId, input: [{ type: "text", text: input.message, text_elements: [] }] };
-  try { validate("turn/start:request", params); } catch { return fail(generic("invalid", "Invalid prompt request")); }
+  let params: CodexPayloads["turn/start:request"];
+  try {
+    params = { threadId: state.threadId, ...(input.batch ? codexBatchInput(input.batch) : { input: [{ type: "text", text: input.message, text_elements: [] }] }) };
+    validate("turn/start:request", params);
+  } catch { return fail(generic("invalid", "Invalid prompt request")); }
   let resolveCompletion!: Waiter;
   const completion = new Promise<TurnEnd>(resolve => { resolveCompletion = resolve; });
   const starting: Extract<TurnState, { kind: "starting" }> = { kind: "starting", requestId: input.requestId, stopRequested: false, early: [], waiters: new Set([resolveCompletion]) };
@@ -986,6 +1056,7 @@ async function promptCodexSessionImpl(actor: Actor, input: PromptInput, kind: "p
     scheduleHealth(actor);
     if (starting.stopRequested && state.turn.kind === "stopping") void interrupt(actor, state, turnId);
     for (const event of starting.early) handleNotification(actor, event);
+    pumpCodexSteering(actor);
     return ok({ kind: "live", turnId, completion });
   })();
   extra.active = { requestId: input.requestId, digest: requestDigest, promise, completion };
@@ -1003,6 +1074,59 @@ export async function promptCodexHandoffSession(actor: Actor, input: PromptInput
   catch (error) { return captureConflict(error); }
 }
 
+function streamingCodexSessionImpl(actor: Actor, input: PromptInput, behavior: StreamBehavior): Promise<Result<{ queued: boolean; turnId?: TurnId }>> {
+  if (!parseCodexRequestId(input.requestId) || typeof input.message !== "string" || !input.message.trim()) return Promise.resolve(fail(generic("invalid", "Invalid streaming prompt")));
+  if (actor.state.kind !== "ready") return Promise.resolve(fail(actor.state.kind === "error" ? actor.state.failure : generic("closed", "Codex session is closed")));
+  const extra = extras.get(actor)!;
+  const requestDigest = digest([behavior, input.message]);
+  const previous = extra.streamReceipts.get(input.requestId);
+  if (previous) return previous.digest === requestDigest ? previous.promise : Promise.resolve(fail(generic("conflict", "Request conflicts with an earlier request")));
+  const promise = extra.streamAdmission.then(async () => {
+    const failure = await projectDirectoryFailure(actor.cwd);
+    if (failure) return fail<{ queued: boolean; turnId?: TurnId }>(failure);
+    if (actor.state.kind !== "ready") return fail<{ queued: boolean; turnId?: TurnId }>(generic("closed", "Codex session is closed"));
+    if (actor.state.turn.kind === "idle") {
+      const result = await promptCodexSession(actor, input);
+      return result.ok ? ok({ queued: false, turnId: result.value.turnId }) : result;
+    }
+    if (behavior === "steer") extra.steering.push({ input, status: "queued" });
+    else extra.followUps.push(input);
+    emitQueue(actor);
+    if (behavior === "steer") pumpCodexSteering(actor);
+    return ok({ queued: true });
+  });
+  extra.streamAdmission = promise.then(() => undefined, () => undefined);
+  const receipt: StreamingReceipt = { digest: requestDigest, promise };
+  extra.streamReceipts.set(input.requestId, receipt);
+  void promise.then(result => {
+    if (!result.ok && result.error.kind !== "outcome-unknown" && extra.streamReceipts.get(input.requestId) === receipt) extra.streamReceipts.delete(input.requestId);
+  });
+  return promise;
+}
+
+export function streamingCodexSession(actor: Actor, input: PromptInput, behavior: StreamBehavior): Promise<Result<{ queued: boolean; turnId?: TurnId }>> {
+  try { return withCodexMutationAdmission(actor.sessionId, () => streamingCodexSessionImpl(actor, input, behavior)); }
+  catch (error) { return Promise.resolve(captureConflict(error)); }
+}
+
+function takeCodexQueue(actor: Actor): { steering: string[]; followUp: string[] } {
+  const extra = extras.get(actor)!;
+  const steering = extra.steering.splice(0).map(row => row.input.message);
+  const followUp = extra.followUps.splice(0).map(input => input.message);
+  emitQueue(actor);
+  return { steering, followUp };
+}
+
+export function clearCodexQueue(actor: Actor): Result<{ steering: string[]; followUp: string[] }> {
+  try {
+    return withCodexMutationAdmission(actor.sessionId, () => {
+      const extra = extras.get(actor)!;
+      if (extra.steering.some(row => row.status === "sent")) return fail(generic("conflict", "Wait for the active steer before recalling the queue"));
+      return ok(takeCodexQueue(actor));
+    });
+  } catch (error) { return captureConflict(error); }
+}
+
 function steerCodexSessionImpl(actor: Actor, input: PromptInput): Promise<Result<{ turnId: TurnId }>> {
   if (!parseCodexRequestId(input.requestId) || typeof input.message !== "string" || !input.message.trim()) return Promise.resolve(fail(generic("invalid", "Invalid steer request")));
   if (actor.state.kind !== "ready") return Promise.resolve(fail(actor.state.kind === "error" ? actor.state.failure : generic("closed", "Codex session is closed")));
@@ -1016,7 +1140,7 @@ function steerCodexSessionImpl(actor: Actor, input: PromptInput): Promise<Result
   if (current?.kind === "ambiguous") return Promise.resolve(fail({ kind: "outcome-unknown", operation: "steer", turnId: turn.turnId }));
   const requestDigest = digest([input.message]);
   if (current?.kind === "pending") return current.requestId === input.requestId && current.digest === requestDigest ? current.promise : Promise.resolve(fail(generic("conflict", "Codex steer is busy")));
-  const params = { threadId: state.threadId, expectedTurnId: turn.turnId, input: [{ type: "text", text: input.message, text_elements: [] }] };
+  const params = { threadId: state.threadId, expectedTurnId: turn.turnId, clientUserMessageId: input.requestId, input: [{ type: "text", text: input.message, text_elements: [] }] };
   try { validate("turn/steer:request", params); } catch { return Promise.resolve(fail(generic("invalid", "Invalid steer request"))); }
   const pending: Extract<SteerState, { kind: "pending" }> = { kind: "pending", turnId: turn.turnId, requestId: input.requestId, digest: requestDigest, promise: undefined! };
   extra.steer = pending;
@@ -1051,6 +1175,25 @@ export function steerCodexSession(actor: Actor, input: PromptInput): Promise<Res
   catch (error) { return Promise.resolve(captureConflict(error)); }
 }
 
+function pumpCodexSteering(actor: Actor): void {
+  const extra = extras.get(actor)!;
+  const next = extra.queueModes.steering === "all" && !extra.steering.some((row) => row.status === "unknown" || row.status === "blocked")
+    ? extra.steering.find((row) => row.status === "queued") : extra.steering[0];
+  if (actor.state.kind !== "ready" || actor.state.turn.kind !== "running" || !next || next.status !== "queued" || extra.steerPump || extra.steer) return;
+  next.status = "sent";
+  const pending = steerCodexSession(actor, next.input).then(result => {
+    if (!result.ok && extra.steering.includes(next)) {
+      next.status = result.error.kind === "outcome-unknown" ? "unknown" : "blocked";
+      emitQueue(actor);
+      emit(actor, { type: "prompt_error", errorMessage: "Codex could not confirm the queued steer. Check the conversation before retrying." });
+    }
+  }).finally(() => {
+    if (extra.steerPump === pending) extra.steerPump = undefined;
+    pumpCodexSteering(actor);
+  });
+  extra.steerPump = pending;
+}
+
 async function interrupt(actor: Actor, state: Extract<ActorState, { kind: "ready" }>, turnId: TurnId) {
   try {
     const params = { threadId: state.threadId, turnId };
@@ -1076,7 +1219,13 @@ async function stopCodexSessionImpl(actor: Actor): Promise<Result<StopResult>> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const result = await Promise.race([completion, new Promise<TurnEnd>(resolve => { timer = setTimeout(() => resolve({ kind: "stopped" }), 30000); })]);
   if (timer) clearTimeout(timer);
-  if (result.kind === "stopped") await shutdownCodexSession(actor);
+  if (result.kind === "stopped") {
+    const uncertain = extras.get(actor)!.steering.some(row => row.status === "sent" || row.status === "unknown");
+    const recalled = takeCodexQueue(actor);
+    if (uncertain) emit(actor, { type: "prompt_error", errorMessage: "Codex could not confirm the queued steer. Check the conversation before retrying." });
+    await shutdownCodexSession(actor);
+    return ok({ stopped: true, completion: result, ...recalled });
+  }
   return ok({ stopped: true, completion: result });
 }
 
@@ -1137,7 +1286,7 @@ export function codexTurnSnapshot(actor: Actor) {
 export function codexSessionState(actor: Actor) {
   const active = actor.state.kind === "ready" && actor.state.turn.kind !== "idle";
   const isCompacting = extras.get(actor)!.operation?.kind === "compact";
-  return { backend: "codex", isCompacting, capabilities: CODEX_CAPABILITIES, settings: extras.get(actor)!.settings, settingsPending: Boolean(extras.get(actor)!.settingsPending), settingsUncertain: Boolean(extras.get(actor)!.settingsUncertain), isStreaming: active, isPromptRunning: active };
+  return { backend: "codex", isCompacting, capabilities: CODEX_CAPABILITIES, settings: extras.get(actor)!.settings, settingsPending: Boolean(extras.get(actor)!.settingsPending), settingsUncertain: Boolean(extras.get(actor)!.settingsUncertain), isStreaming: active, isPromptRunning: active, queuedMessages: queuedMessages(actor) };
 }
 export function codexLeaseState(actor: Actor) {
   const extra = extras.get(actor);

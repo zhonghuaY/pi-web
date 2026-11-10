@@ -44,6 +44,7 @@ test.after(async () => {
   const pendingSearch = globalThis.__piCodexBrowseState?.search;
   pendingSearch?.controller.abort();
   await pendingSearch?.promise;
+  await globalThis.__piCodexBrowseState?.scan?.promise;
   for (const [key, value] of Object.entries(saved)) { if (value === undefined) delete process.env[key]; else process.env[key] = value; }
   await rm(home, { recursive: true, force: true });
 });
@@ -66,6 +67,19 @@ const nativeId = '019a1234-abcd-7abc-8abc-123456789abc';
 const id = `codex:${nativeId}`;
 const native = (overrides = {}) => ({ id: nativeId, sessionId: nativeId, preview: 'hello', ephemeral: false, projectId: null, modelProvider: 'openai', createdAt: 1, updatedAt: 2, cwd: home, cliVersion: '0.153.4', source: 'cli', status: { type: 'idle' }, turns: [], ...overrides });
 const call = (handler, query = '') => handler(new Request(`http://localhost/api/sessions/test${query}`), { params: Promise.resolve({ id }) });
+const readyCatalogue = async predicate => {
+  const deadline = Date.now() + 8_000;
+  let force = true;
+  do {
+    const response = await list(new Request(`http://localhost/api/sessions?summary=1${force ? '&force=1' : ''}`));
+    force = false;
+    assert.equal(response.status, 200);
+    const catalogue = await response.json();
+    if (predicate(catalogue)) return catalogue;
+    await new Promise(resolve => setTimeout(resolve, 40));
+  } while (Date.now() < deadline);
+  assert.fail('native catalogue did not converge');
+};
 
 process.env.TEST_PAGE_ONE = JSON.stringify({ data: [native({ name: 'Renamed' })], nextCursor: 'second' });
 process.env.TEST_PAGE_TWO = JSON.stringify({ data: [native({ id: '019a1234-abcd-7abc-8abc-123456789abd', sessionId: '019a1234-abcd-7abc-8abc-123456789abd', preview: 'External CLI' })], nextCursor: null });
@@ -81,9 +95,7 @@ test('lists all pages and reads a completed external thread without starting a r
   assert.equal(codex.available, true);
   assert.equal(codex.capabilities.history, true);
   assert.equal(codex.capabilities.prompt, true);
-  const response = await list(new Request('http://localhost/api/sessions?summary=1'));
-  assert.equal(response.status, 200);
-  const catalogue = await response.json();
+  const catalogue = await readyCatalogue(value => value.sessions.some(row => row.id === id && row.name === 'Renamed') && value.sessions.some(row => row.firstMessage === 'External CLI'));
   assert.equal(catalogue.sessions.find(row => row.id === id).name, 'Renamed');
   assert.ok(catalogue.sessions.some(row => row.firstMessage === 'External CLI'));
   const first = await call(read, '?tail=1');
@@ -110,7 +122,7 @@ test('search includes matching Codex history after a bounded partial response', 
     assert.equal(result.truncated, true);
     assert.equal(result.backendErrors?.codex, 'Codex session history is unavailable');
     const deadline = Date.now() + 8_000;
-    while (!result.results.some(hit => hit.session.id === id && hit.match === 'answer') && Date.now() < deadline) {
+    while ((result.pending === true || !result.results.some(hit => hit.session.id === id && hit.match === 'answer')) && Date.now() < deadline) {
       await new Promise(resolve => setTimeout(resolve, 40));
       response = await query();
       assert.equal(response.status, 200);
@@ -121,7 +133,8 @@ test('search includes matching Codex history after a bounded partial response', 
       }
     }
     assert.ok(result.results.some(hit => hit.session.id === id && hit.match === 'answer'));
-    assert.equal(result.backendErrors?.codex, undefined);
+    assert.notEqual(result.pending, true);
+    assert.equal(result.backendErrors?.codex, undefined, JSON.stringify({ pending: result.pending, catalogueError: globalThis.__piCodexBrowseState?.catalogue?.value.error, scanActive: Boolean(globalThis.__piCodexBrowseState?.scan) }));
   } finally {
     if (previousDelay === undefined) delete process.env.TEST_SEARCH_READ_DELAY_MS;
     else process.env.TEST_SEARCH_READ_DELAY_MS = previousDelay;
@@ -134,7 +147,7 @@ test('an empty unsaved thread remains distinguishable from unavailable history',
   process.env.TEST_PAGE_ONE = JSON.stringify({ data: [native({ ephemeral: true })], nextCursor: null });
   process.env.TEST_THREAD_READ = JSON.stringify({ thread: native({ ephemeral: true }) });
   try {
-    const catalogue = await (await list(new Request('http://localhost/api/sessions?summary=1&force=1'))).json();
+    const catalogue = await readyCatalogue(value => value.sessions.some(row => row.id === id && row.transient === true));
     assert.equal(catalogue.sessions.find(row => row.id === id).transient, true);
     const response = await call(read);
     assert.equal(response.status, 200);
@@ -148,7 +161,7 @@ test('early refusal stays unavailable but a missing cwd only prevents runtime ad
     const refusal = await call(read);
     assert.equal(refusal.status, 503);
     assert.equal((await refusal.json()).reason, 'backend-unavailable');
-    const catalogue = await (await list(new Request('http://localhost/api/sessions?summary=1&force=1'))).json();
+    const catalogue = await readyCatalogue(value => value.sessions.some(row => row.id === 'codex:019a1234-abcd-7abc-8abc-123456789abd') && value.backendErrors?.codex === 'Codex session history is unavailable');
     assert.ok(catalogue.sessions.some(row => row.id === id));
     assert.ok(catalogue.sessions.some(row => row.id === 'codex:019a1234-abcd-7abc-8abc-123456789abd'));
     assert.ok(catalogue.sessions.some(row => row.id === pi.getSessionId()));

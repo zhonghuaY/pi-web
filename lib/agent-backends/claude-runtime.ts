@@ -2,6 +2,7 @@ import {
   query as sdkQuery,
   type CanUseTool,
   type EffortLevel,
+  type HookInput,
   type ModelInfo,
   type PermissionMode,
   type PermissionResult,
@@ -24,6 +25,7 @@ import {
 } from "./claude-input";
 export { sanitizeClaudeEnvironment } from "./claude-executable";
 import { readClaudeConfiguration } from "./claude-config";
+import { readPiQueueModes, type QueueModes } from "./queue-modes";
 import { projectSessionHandoffMessage } from "../session-handoff";
 import { isRecord, projectSdkAssistant, projectSdkUser } from "./claude-projection";
 import {
@@ -57,32 +59,50 @@ function projectClaudeCommands(values: unknown[], terminalOnlyNames: readonly st
 
 type EventListener = (event: ClaudeAgentEvent) => void;
 type Lifecycle = "dormant" | "idle" | "running" | "awaiting-input" | "closing" | "closed";
+type QueuedPrompt = { id: string; text: string; message: SDKUserMessage };
+type SteeringPrompt = QueuedPrompt & { unknown?: boolean };
+type SteeringDelivery = { prompt: SteeringPrompt; flushed: Promise<boolean>; kind?: "steering" | "followUp" };
+type BoundaryBatch = { kind: "steering" | "followUp"; remaining: SteeringPrompt[]; currentId: string };
 
 class AsyncInputQueue implements AsyncIterable<SDKUserMessage> {
-  private rows: SDKUserMessage[] = [];
-  private waiters: Array<(value: IteratorResult<SDKUserMessage>) => void> = [];
+  private rows: Array<{ message: SDKUserMessage; flushed: (written: boolean) => void }> = [];
+  private waiters: Array<(row: { message: SDKUserMessage; flushed: (written: boolean) => void } | null) => void> = [];
+  private writing: ((written: boolean) => void) | undefined;
   private closed = false;
 
-  push(message: SDKUserMessage): void {
+  push(message: SDKUserMessage): Promise<boolean> {
     if (this.closed) throw new Error("Claude input is closed");
-    const waiter = this.waiters.shift();
-    if (waiter) waiter({ done: false, value: message });
-    else this.rows.push(message);
+    return new Promise((flushed) => {
+      const row = { message, flushed };
+      const waiter = this.waiters.shift();
+      if (waiter) waiter(row);
+      else this.rows.push(row);
+    });
   }
 
   close(): void {
     if (this.closed) return;
     this.closed = true;
-    for (const waiter of this.waiters.splice(0)) waiter({ done: true, value: undefined });
+    this.writing?.(false);
+    this.writing = undefined;
+    for (const row of this.rows.splice(0)) row.flushed(false);
+    for (const waiter of this.waiters.splice(0)) waiter(null);
   }
 
   [Symbol.asyncIterator](): AsyncIterator<SDKUserMessage> {
     return {
       next: () => {
+        this.writing?.(true);
+        this.writing = undefined;
+        const deliver = (row: { message: SDKUserMessage; flushed: (written: boolean) => void } | null): IteratorResult<SDKUserMessage> => {
+          if (!row) return { done: true, value: undefined };
+          this.writing = row.flushed;
+          return { done: false, value: row.message };
+        };
         const row = this.rows.shift();
-        if (row) return Promise.resolve({ done: false, value: row });
-        if (this.closed) return Promise.resolve({ done: true, value: undefined });
-        return new Promise((resolve) => this.waiters.push(resolve));
+        if (row) return Promise.resolve(deliver(row));
+        if (this.closed) return Promise.resolve(deliver(null));
+        return new Promise((resolve) => this.waiters.push((next) => resolve(deliver(next))));
       },
     };
   }
@@ -102,6 +122,7 @@ export class ClaudeConflictError extends Error {
 
 export interface ClaudeQuery extends AsyncIterable<SDKMessage> {
   interrupt(): Promise<{ still_queued: string[] } | undefined>;
+  cancelAsyncMessage?(id: string): Promise<boolean>;
   setPermissionMode(mode: PermissionMode): Promise<void>;
   setModel(model?: string): Promise<void>;
   applyFlagSettings(settings: { effortLevel?: EffortLevel | null }): Promise<void>;
@@ -120,6 +141,7 @@ export interface ClaudeRuntimeDependencies {
   query: ClaudeQueryFactory;
   acquireLock: (nativeSessionId: string) => Promise<ReleaseClaudeWriterLock>;
   getConfiguration: (cwd: string) => Promise<ClaudeConfigurationSummary>;
+  getQueueModes?: (cwd: string) => QueueModes;
   resolveExecutable?: (env: NodeJS.ProcessEnv) => Promise<string>;
   executablePath?: string;
   env: NodeJS.ProcessEnv;
@@ -132,6 +154,7 @@ const DEFAULT_DEPENDENCIES: ClaudeRuntimeDependencies = {
   query: (params) => sdkQuery(params),
   acquireLock: acquireClaudeWriterLock,
   getConfiguration: readClaudeConfiguration,
+  getQueueModes: readPiQueueModes,
   resolveExecutable: resolveClaudeExecutable,
   env: process.env,
   now: Date.now,
@@ -171,6 +194,7 @@ export class ClaudeSessionWrapper {
   private releaseLock: ReleaseClaudeWriterLock | null = null;
   private pump: Promise<void> | null = null;
   private startPromise: Promise<void> | null = null;
+  private stopPromise: Promise<Record<string, unknown>> | null = null;
   private startupCancellation: "stop" | "close" | null = null;
   private mutationReserved = false;
   private resumeOnNextStart: boolean;
@@ -179,7 +203,16 @@ export class ClaudeSessionWrapper {
   private initialized: SDKSystemMessage | null = null;
   private assistantId: string | null = null;
   private currentAssistant: AssistantMessage | null = null;
-  private queuedFollowUps: Array<{ id: string; text: string }> = [];
+  private queueModes: QueueModes = { steering: "one-at-a-time", followUp: "one-at-a-time" };
+  private queuedFollowUps: SteeringPrompt[] = [];
+  private boundaryBatch: BoundaryBatch | null = null;
+  private queuedSteering: SteeringPrompt[] = [];
+  private readonly steeringInFlight = new Map<string, SteeringDelivery>();
+  private steerStopGate: Promise<void> | null = null;
+  private awaitingSteerContinuation = false;
+  private readonly displayedQueuedMessages = new Set<string>();
+  private awaitingQueuedStart: string | null = null;
+  private stopRequested = false;
   private lastTurnAborted = false;
   private activeStartedAt: number | null = null;
   private accumulatedActiveMs = 0;
@@ -291,7 +324,7 @@ export class ClaudeSessionWrapper {
 
   async send(command: Record<string, unknown>): Promise<unknown> {
     if (this.mutationReserved) throw new ClaudeConflictError("Claude session metadata is being changed");
-    const deduplicated = command.type === "prompt" || command.type === "follow_up";
+    const deduplicated = command.type === "prompt" || command.type === "follow_up" || command.type === "steer";
     const requestKey = deduplicated && typeof command.requestId === "string" && command.requestId ? command.requestId : undefined;
     if (requestKey) {
       const previous = this.acceptedRequests.get(requestKey);
@@ -347,9 +380,12 @@ export class ClaudeSessionWrapper {
       case "compact":
         throw new ClaudeConflictError("Claude compaction is unavailable until advertised by the initialized runtime");
       case "steer":
-        throw new ClaudeConflictError("Claude does not support Pi steer semantics; use follow_up");
+        return this.prompt({ ...command, type: "prompt", streamingBehavior: "steer" });
       case "follow_up":
         return this.prompt({ ...command, type: "prompt", streamingBehavior: "followUp" });
+      case "clear_queue":
+        if (this.stopPromise) await this.stopPromise;
+        return this.clearQueue();
       default:
         throw new Error("Unsupported Claude command: " + (type ?? "missing type"));
     }
@@ -368,7 +404,7 @@ export class ClaudeSessionWrapper {
       model: activeModel ? { provider: "claude", id: activeModel } : null,
       thinkingLevel: this.initialized?.effort ?? this.selectedEffort ?? "native",
       permissionMode: this.options.side ? "plan-locked-no-tools" : this.initialized?.permissionMode ?? this.options.permissionMode ?? "bypassPermissions",
-      queuedMessages: { steering: [], followUp: this.queuedFollowUps.map((row) => row.text) },
+      queuedMessages: { steering: this.queuedSteering.map((row) => row.text), followUp: this.queuedFollowUps.map((row) => row.text) },
       pendingInteractions: [...this.pendingInteractions.values()].map((row) => row.request),
       backgroundTasks: [...this.backgroundTasks].map(([id, task]) => ({ id, ...task })),
       resources: this.initialized ? {
@@ -424,7 +460,6 @@ export class ClaudeSessionWrapper {
   }
 
   private async prompt(command: Record<string, unknown>): Promise<Record<string, unknown>> {
-    if (command.streamingBehavior === "steer") throw new ClaudeConflictError("Claude does not support Pi steer semantics; use follow_up");
     const promptText = stringField(command, "message")?.trim().toLowerCase() ?? "";
     if (this.options.side && /^\/(?:permissions|allowed-tools|mcp|hooks)(?:\s|$)/.test(promptText)) {
       throw new ClaudeConflictError("Claude side-session security settings cannot be changed");
@@ -433,25 +468,34 @@ export class ClaudeSessionWrapper {
     const built = buildClaudeUserMessage(command);
     if (command.trustProject === true) this.trusted = true;
     const running = this.lifecycle === "running" || this.lifecycle === "awaiting-input";
-    if (running && command.streamingBehavior !== "followUp") {
-      throw new ClaudeConflictError("Claude is running; queue this message with follow_up");
+    if (running && command.streamingBehavior !== "followUp" && command.streamingBehavior !== "steer") {
+      throw new ClaudeConflictError("Claude is running; queue this message with steer or follow_up");
     }
     await this.start();
-    if (command.streamingBehavior !== "followUp" && (this.lifecycle === "running" || this.lifecycle === "awaiting-input")) {
-      throw new ClaudeConflictError("Claude is running; queue this message with follow_up");
-    }
-    if (command.streamingBehavior === "followUp") {
-      this.queuedFollowUps.push({ id: built.message.uuid ?? "", text: built.text });
-      this.emitQueue();
-    } else {
-      this.markRunning();
-      this.emit({ type: "agent_start" });
-    }
     const inputQueue = this.inputQueue;
     if (!inputQueue) throw new ClaudeConflictError("Claude startup was cancelled");
-    inputQueue.push(built.message);
+    const queued = this.isStreaming;
+    if (queued && command.streamingBehavior !== "followUp" && command.streamingBehavior !== "steer") {
+      throw new ClaudeConflictError("Claude is running; queue this message with steer or follow_up");
+    }
+    if (queued && command.streamingBehavior === "steer") {
+      if (!this.queryInstance?.cancelAsyncMessage || (this.initialized && !this.supportsSteering())) {
+        throw new ClaudeConflictError("Claude steer is unavailable for this runtime");
+      }
+      this.queuedSteering.push({ id: built.message.uuid ?? "", text: built.text, message: built.message });
+      this.emitQueue();
+    } else if (queued) {
+      this.queuedFollowUps.push({ id: built.message.uuid ?? "", text: built.text, message: built.message });
+      this.emitQueue();
+    } else {
+      this.stopRequested = false;
+      this.markRunning();
+      this.emit({ type: "agent_start" });
+      inputQueue.push({ ...built.message, priority: "now" });
+      if (command.streamingBehavior === "followUp" || command.streamingBehavior === "steer") this.emitQueuedUser(built.message);
+    }
     this.promptAccepted = true;
-    return { accepted: true, requestId: built.message.uuid, queued: command.streamingBehavior === "followUp" };
+    return { accepted: true, requestId: built.message.uuid, queued };
   }
 
   private start(): Promise<void> {
@@ -475,6 +519,8 @@ export class ClaudeSessionWrapper {
       }
       this.releaseLock = await this.dependencies.acquireLock(this.nativeSessionId);
       this.assertStartupActive();
+      this.initialized = null;
+      this.queueModes = this.dependencies.getQueueModes?.(this.cwd) ?? { steering: "one-at-a-time", followUp: "one-at-a-time" };
       this.abortController = new AbortController();
       this.inputQueue = new AsyncInputQueue();
       const executablePath = this.dependencies.resolveExecutable
@@ -497,6 +543,10 @@ export class ClaudeSessionWrapper {
           cwd: this.cwd,
           env: sanitizeClaudeEnvironment(this.dependencies.env),
           includePartialMessages: true,
+          hooks: {
+            PostToolBatch: [{ hooks: [(input) => this.steerBoundary(input)] }],
+            Stop: [{ hooks: [(input) => this.steerBoundary(input)] }],
+          },
           forwardSubagentText: false,
           pathToClaudeCodeExecutable: executablePath,
           persistSession: true,
@@ -621,7 +671,15 @@ export class ClaudeSessionWrapper {
     this.emit({ type: "agent_interaction_closed", id, reason });
   }
 
-  private async stop(): Promise<Record<string, unknown>> {
+  private stop(): Promise<Record<string, unknown>> {
+    if (this.stopPromise) return this.stopPromise;
+    const pending = this.stopOnce();
+    this.stopPromise = pending;
+    void pending.finally(() => { if (this.stopPromise === pending) this.stopPromise = null; }).catch(() => undefined);
+    return pending;
+  }
+
+  private async stopOnce(): Promise<Record<string, unknown>> {
     const starting = this.startPromise;
     if (starting) {
       this.startupCancellation = "stop";
@@ -632,35 +690,75 @@ export class ClaudeSessionWrapper {
       return { stopped: true, cancelledStartup: true, stillQueued: [] };
     }
     if (!this.queryInstance) return { stopped: false, reason: "session-not-started" };
+    if (!this.isStreaming) return { stopped: false };
+    this.stopRequested = true;
+    let releaseGate!: () => void;
+    const gate = new Promise<void>((resolve) => { releaseGate = resolve; });
+    this.steerStopGate = gate;
     for (const id of [...this.pendingInteractions.keys()]) {
       this.closeInteraction(id, "cancelled", { behavior: "deny", message: "Session stopped", decisionClassification: "user_reject" });
     }
     const query = this.queryInstance;
+    const deliveries = [...this.steeringInFlight.values()];
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timeout = new Promise<"timeout">((resolve) => {
       timer = setTimeout(() => resolve("timeout"), this.dependencies.interruptTimeoutMs ?? 5_000);
       timer.unref?.();
     });
-    let result: Awaited<ReturnType<ClaudeQuery["interrupt"]>> | "timeout";
     try {
-      result = await Promise.race([query.interrupt(), timeout]);
+      const stop = (async () => {
+        const cancelled = await Promise.all(deliveries.map(async (delivery) => {
+          if (!await delivery.flushed || !query.cancelAsyncMessage) throw new Error("Claude steer delivery is uncertain");
+          const cancelled = await query.cancelAsyncMessage(delivery.prompt.id);
+          if (typeof cancelled !== "boolean") throw new Error("Claude steer cancellation was not confirmed");
+          return cancelled;
+        }));
+        return { cancelled, receipt: await query.interrupt() };
+      })();
+      const result = await Promise.race([stop, timeout]);
+      if (result === "timeout") return await this.forceStop(query);
+      if (deliveries.some((delivery, index) => this.steeringInFlight.has(delivery.prompt.id) && !result.cancelled[index]
+        && (!result.receipt || !Array.isArray(result.receipt.still_queued) || result.receipt.still_queued.includes(delivery.prompt.id)))) {
+        return await this.forceStop(query);
+      }
+      const restored: SteeringDelivery[] = [];
+      let unconfirmed = false;
+      for (const [index, delivery] of deliveries.entries()) {
+        if (!this.steeringInFlight.has(delivery.prompt.id)) continue;
+        if (result.cancelled[index]) restored.push(delivery);
+        else { restored.push({ ...delivery, prompt: { ...delivery.prompt, unknown: true } }); unconfirmed = true; }
+        this.steeringInFlight.delete(delivery.prompt.id);
+      }
+      this.boundaryBatch = null;
+      this.restoreDeliveries(restored);
+      if (unconfirmed) this.emit({ type: "prompt_error", errorMessage: "Claude could not confirm the queued steer. Check the conversation before retrying." });
+      return { stopped: true, stillQueued: result.receipt?.still_queued ?? [] };
     } catch {
-      this.inputQueue?.close();
-      this.abortController?.abort();
-      query.close();
-      await this.finishClosedRuntime();
-      throw new Error("Claude runtime could not be interrupted");
+      return await this.forceStop(query);
     } finally {
       if (timer) clearTimeout(timer);
+      releaseGate();
+      if (this.steerStopGate === gate) this.steerStopGate = null;
     }
-    if (result === "timeout") {
-      this.inputQueue?.close();
-      this.abortController?.abort();
-      query.close();
-      await this.finishClosedRuntime();
-      return { stopped: true, forced: true, stillQueued: [] };
+  }
+
+  private async forceStop(query: ClaudeQuery): Promise<Record<string, unknown>> {
+    if (this.steeringInFlight.size) {
+      this.restoreDeliveries([...this.steeringInFlight.values()]);
+      this.steeringInFlight.clear();
+      this.emit({ type: "prompt_error", errorMessage: "Claude could not confirm the queued steer. Check the conversation before retrying." });
     }
-    return { stopped: true, stillQueued: result?.still_queued ?? [] };
+    const recalled = this.clearQueue();
+    this.finishAssistantMessage();
+    this.lifecycle = "closing";
+    this.inputQueue?.close();
+    this.abortController?.abort();
+    query.close();
+    await this.finishClosedRuntime();
+    this.emit({ type: "agent_end" });
+    this.emit({ type: "prompt_done", aborted: true, subagentsActive: false });
+    this.emit({ type: "agent_settled", aborted: true, subagentsActive: false });
+    return { stopped: true, forced: true, stillQueued: [], ...recalled };
   }
 
   private async setModel(command: Record<string, unknown>): Promise<Record<string, unknown>> {
@@ -766,6 +864,9 @@ export class ClaudeSessionWrapper {
   private consumeSystem(message: Extract<SDKMessage, { type: "system" }>): void {
     if (message.subtype === "init") {
       this.initialized = message;
+      if (this.queuedSteering.length && !this.supportsSteering()) {
+        this.emit({ type: "prompt_error", errorMessage: "Claude steer is unavailable for this runtime. Recall queued steers before continuing." });
+      }
       this.selectedModel = message.model;
       this.selectedEffort = parseClaudeEffort(message.effort) ?? this.selectedEffort;
       this.emit({ type: "claude_initialized", model: message.model, permissionMode: message.permissionMode, effort: message.effort });
@@ -776,6 +877,7 @@ export class ClaudeSessionWrapper {
       });
     } else if (message.subtype === "session_state_changed") {
       if (message.state === "idle") {
+        if (this.awaitingQueuedStart || this.awaitingSteerContinuation || this.steerStopGate) return;
         if (this.isStreaming) this.settleTurn(this.lastTurnAborted);
         else this.armIdleTimer();
       } else if (message.state === "requires_action" && this.isStreaming) {
@@ -805,8 +907,10 @@ export class ClaudeSessionWrapper {
   }
 
   private consumeUser(source: SDKUserMessage): void {
+    const displayed = !source.isSynthetic && source.uuid ? this.displayedQueuedMessages.delete(source.uuid) : false;
     const projected = projectSdkUser(source, projectSessionHandoffMessage);
     for (const message of projected) {
+      if (displayed && message.role === "user") continue;
       this.emit({ type: "message_start", message });
       this.emit({ type: "message_end", message });
       if (message.role === "toolResult") {
@@ -818,15 +922,7 @@ export class ClaudeSessionWrapper {
         });
       }
     }
-    if (!source.isSynthetic && source.uuid) {
-      const queued = this.queuedFollowUps.findIndex((row) => row.id === source.uuid);
-      if (queued >= 0) {
-        this.queuedFollowUps.splice(queued, 1);
-        this.markRunning();
-        this.emit({ type: "agent_start" });
-        this.emitQueue();
-      }
-    }
+    if (!source.isSynthetic && source.uuid && source.uuid === this.awaitingQueuedStart) this.awaitingQueuedStart = null;
   }
 
   private consumeStreamEvent(event: unknown): void {
@@ -960,18 +1056,157 @@ export class ClaudeSessionWrapper {
       cumulativeTotalCostUsd: result.total_cost_usd,
       cumulativeModelUsage: result.modelUsage,
     };
-    this.lastTurnAborted = result.subtype !== "success" || result.is_error;
+    const consumed = new Set(result.user_message_uuids ?? []);
+    if (result.user_message_uuid) consumed.add(result.user_message_uuid);
+    let reconciled = false;
+    for (const id of consumed) {
+      this.steeringInFlight.delete(id);
+      for (const queue of [this.queuedSteering, this.queuedFollowUps]) {
+        const index = queue.findIndex((prompt) => prompt.unknown && prompt.id === id);
+        if (index >= 0) { queue.splice(index, 1); reconciled = true; }
+      }
+    }
+    if (reconciled) this.emitQueue();
+    if (this.awaitingSteerContinuation && !this.stopRequested && !this.steerStopGate && result.subtype === "success" && !result.is_error
+      && (!this.boundaryBatch || !consumed.has(this.boundaryBatch.currentId))) {
+      this.awaitingSteerContinuation = false;
+      return;
+    }
+    this.awaitingSteerContinuation = false;
+    if (this.boundaryBatch && consumed.has(this.boundaryBatch.currentId)) {
+      if (!this.stopRequested && !this.steerStopGate && result.subtype === "success" && !result.is_error && this.sendNextBatchPrompt()) return;
+      this.boundaryBatch = null;
+    }
+    this.awaitingQueuedStart = null;
+    this.lastTurnAborted = this.stopRequested || result.subtype !== "success" || result.is_error;
+    this.stopRequested = false;
+    if (!this.steerStopGate && this.steeringInFlight.size) this.retainUnconfirmedSteers();
+    this.boundaryBatch = null;
+    if (!this.lastTurnAborted && !this.steerStopGate && !this.queuedSteering.length && this.deliverFollowUp()) return;
     this.emit({ type: "agent_end" });
     this.emit({ type: "prompt_done", aborted: this.lastTurnAborted, subagentsActive: this.hasActiveSubagents() });
     this.settleTurn(this.lastTurnAborted);
   }
 
   private settleTurn(aborted: boolean): void {
-    this.lifecycle = this.queuedFollowUps.length ? "running" : "idle";
+    this.lifecycle = "idle";
     this.finishActiveClock();
     this.armIdleTimer();
-    if (!this.queuedFollowUps.length) this.emit({ type: "agent_settled", aborted, subagentsActive: this.hasActiveSubagents() });
+    this.emit({ type: "agent_settled", aborted, subagentsActive: this.hasActiveSubagents() });
     this.lastTurnAborted = false;
+  }
+
+  private supportsSteering(): boolean {
+    return Boolean(this.initialized?.capabilities?.includes("interrupt_receipt_v1")
+      && this.initialized.capabilities.includes("interrupt_cancel_queued_v1") && this.queryInstance?.cancelAsyncMessage);
+  }
+
+  private async steerBoundary(input: HookInput): Promise<Record<string, never>> {
+    if (input.agent_id || !this.isStreaming || this.stopRequested || Boolean(this.steerStopGate) || !this.supportsSteering()) return {};
+    const kind = this.queuedSteering.length ? "steering" : "followUp";
+    if (kind === "followUp" && (input.hook_event_name !== "Stop" || this.queueModes.followUp !== "all")) return {};
+    const queue = kind === "steering" ? this.queuedSteering : this.queuedFollowUps;
+    const next = queue[0];
+    const inputQueue = this.inputQueue;
+    if (!next || next.unknown || !inputQueue || this.boundaryBatch) return {};
+    const all = this.queueModes[kind] === "all";
+    const firstUnknown = queue.findIndex((prompt) => prompt.unknown);
+    const count = all ? (firstUnknown < 0 ? queue.length : firstUnknown) : 1;
+    if (input.hook_event_name === "Stop") this.awaitingSteerContinuation = true;
+    if (input.hook_event_name === "Stop" && count > 1) {
+      const batch: BoundaryBatch = { kind, remaining: queue.slice(0, count), currentId: "" };
+      this.boundaryBatch = batch;
+      this.sendNextBatchPrompt();
+      const written = this.steeringInFlight.get(batch.currentId)?.flushed;
+      if (written) await written;
+    } else {
+      const prompts = queue.splice(0, count);
+      const flushed = prompts.map((prompt) => {
+        const written = inputQueue.push({ ...prompt.message, priority: "next" });
+        this.steeringInFlight.set(prompt.id, { prompt, kind, flushed: written });
+        return written;
+      });
+      this.emitQueue();
+      for (const prompt of prompts) this.emitQueuedUser(prompt.message);
+      await Promise.all(flushed);
+    }
+    if (this.steerStopGate) await this.steerStopGate;
+    return {};
+  }
+
+  private sendNextBatchPrompt(): boolean {
+    const batch = this.boundaryBatch;
+    const inputQueue = this.inputQueue;
+    if (!batch || !inputQueue) return false;
+    const queue = batch.kind === "steering" ? this.queuedSteering : this.queuedFollowUps;
+    batch.remaining = batch.remaining.filter((prompt) => queue.includes(prompt));
+    const next = batch.remaining.shift();
+    if (!next) return false;
+    queue.splice(queue.indexOf(next), 1);
+    batch.currentId = next.id;
+    const flushed = inputQueue.push({ ...next.message, priority: "next", shouldQuery: batch.remaining.length === 0 });
+    this.steeringInFlight.set(next.id, { prompt: next, kind: batch.kind, flushed });
+    this.awaitingQueuedStart = next.id;
+    this.emitQueue();
+    this.emitQueuedUser(next.message);
+    return true;
+  }
+
+  private restoreDeliveries(deliveries: SteeringDelivery[]): void {
+    if (!deliveries.length) return;
+    this.queuedSteering.unshift(...deliveries.filter((delivery) => delivery.kind !== "followUp").map((delivery) => delivery.prompt));
+    this.queuedFollowUps.unshift(...deliveries.filter((delivery) => delivery.kind === "followUp").map((delivery) => delivery.prompt));
+    this.emitQueue();
+  }
+
+  private retainUnconfirmedSteers(): void {
+    if (!this.steeringInFlight.size) return;
+    this.restoreDeliveries([...this.steeringInFlight.values()].map((delivery) => ({ ...delivery, prompt: { ...delivery.prompt, unknown: true } })));
+    this.steeringInFlight.clear();
+    this.emit({ type: "prompt_error", errorMessage: "Claude could not confirm the queued message. Check the conversation before retrying." });
+  }
+
+  private deliverFollowUp(): boolean {
+    const next = this.queuedFollowUps[0];
+    if (!next || next.unknown || !this.inputQueue) return false;
+    if (this.queueModes.followUp === "all" && this.queuedFollowUps.length > 1 && this.supportsSteering()) {
+      const firstUnknown = this.queuedFollowUps.findIndex((prompt) => prompt.unknown);
+      this.boundaryBatch = { kind: "followUp", remaining: this.queuedFollowUps.slice(0, firstUnknown < 0 ? undefined : firstUnknown), currentId: "" };
+      return this.sendNextBatchPrompt();
+    }
+    this.awaitingQueuedStart = next.id;
+    this.inputQueue.push({ ...next.message, priority: "now" });
+    this.queuedFollowUps.shift();
+    this.emitQueue();
+    this.markRunning();
+    this.emitQueuedUser(next.message);
+    return true;
+  }
+
+  private emitQueuedUser(source: SDKUserMessage): void {
+    if (source.uuid) {
+      this.displayedQueuedMessages.add(source.uuid);
+      if (this.displayedQueuedMessages.size > 100) {
+        const oldest = this.displayedQueuedMessages.values().next().value;
+        if (oldest) this.displayedQueuedMessages.delete(oldest);
+      }
+    }
+    for (const message of projectSdkUser(source, projectSessionHandoffMessage)) {
+      if (message.role !== "user") continue;
+      this.emit({ type: "message_start", message });
+      this.emit({ type: "message_end", message });
+    }
+  }
+
+  private clearQueue(): { steering: string[]; followUp: string[]; images?: Array<{ data: string; mimeType: string }> } {
+    const steering = this.queuedSteering.splice(0);
+    const followUp = this.queuedFollowUps.splice(0);
+    const images = [...steering, ...followUp].flatMap(({ message }) => Array.isArray(message.message.content)
+      ? message.message.content.flatMap((block) => block.type === "image" && block.source.type === "base64"
+        ? [{ data: block.source.data, mimeType: block.source.media_type }] : [])
+      : []);
+    this.emitQueue();
+    return { steering: steering.map((row) => row.text), followUp: followUp.map((row) => row.text), ...(images.length ? { images } : {}) };
   }
 
   private markRunning(): void {
@@ -987,7 +1222,7 @@ export class ClaudeSessionWrapper {
   }
 
   private emitQueue(): void {
-    this.emit({ type: "queue_update", steering: [], followUp: this.queuedFollowUps.map((row) => row.text) });
+    this.emit({ type: "queue_update", steering: this.queuedSteering.map((row) => row.text), followUp: this.queuedFollowUps.map((row) => row.text) });
   }
 
   private emit(event: ClaudeAgentEvent): void {
@@ -1026,12 +1261,13 @@ export class ClaudeSessionWrapper {
         decisionClassification: "user_reject",
       });
     }
-    if (this.queuedFollowUps.length) {
-      this.queuedFollowUps = [];
-      this.emitQueue();
-    }
+    this.retainUnconfirmedSteers();
     this.inputQueue?.close();
     this.inputQueue = null;
+    this.awaitingQueuedStart = null;
+    this.awaitingSteerContinuation = false;
+    this.boundaryBatch = null;
+    this.stopRequested = false;
     this.backgroundTasks.clear();
     this.queryInstance = null;
     this.abortController = null;
@@ -1058,6 +1294,7 @@ export class ClaudeSessionWrapper {
     if (starting) await starting.catch(() => undefined);
     this.lifecycle = "closing";
     if (this.pump) await this.pump.catch(() => undefined);
+    if (this.queuedFollowUps.length || this.queuedSteering.length) this.clearQueue();
     await this.finishClosedRuntime();
     this.lifecycle = "closed";
     this.listeners.clear();

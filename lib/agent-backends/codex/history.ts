@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import type { AgentMessage, SessionContext } from "@/lib/types";
 import type { CodexThread } from "./catalogue";
 import { projectSessionHandoffMessage } from "@/lib/session-handoff";
+import { codexBatchMessages } from "./batch";
 import { codexUserText } from "./user-envelope";
 import { projectCodexSessionInfo, CODEX_CAPABILITIES } from "./projection";
 
@@ -55,18 +56,25 @@ export function projectItem(item: Item, thread: CodexThread): Entry {
   return { id: item.id, message: { role: "custom", customType: item.type, content: "", display: true } };
 }
 
+export function projectUserItems(item: Item, thread: CodexThread): Entry[] {
+  const batch = item.type === "userMessage" ? codexBatchMessages(item) : null;
+  return batch ? batch.map(({ id, text }) => ({ id, message: { role: "user", content: text } })) : [projectItem(item, thread)];
+}
+
 export function projectCodexHandoffMessages(thread: CodexThread): AgentMessage[] {
-  return thread.turns.flatMap((turn) => turn.items.map((item) => {
-    if (item.type !== "userMessage") return projectItem(item, thread).message;
+  return thread.turns.flatMap((turn) => turn.items.flatMap((item) => {
+    if (item.type !== "userMessage") return [projectItem(item, thread).message];
+    const batch = codexBatchMessages(item);
+    if (batch) return batch.map(({ text }) => ({ role: "user" as const, content: text }));
     const message = { role: "user" as const, content: codexUserText(item) ?? "" };
-    return projectSessionHandoffMessage(message) ?? message;
+    return [projectSessionHandoffMessage(message) ?? message];
   }));
 }
 
 export function projectCodexHistory(thread: CodexThread, options: { tail: number; before?: string }) {
   const projection = projectCodexSessionInfo(thread);
   if (projection.state !== "projected") throw new Error(`Codex session metadata ${projection.reason}`);
-  const entries = thread.turns.flatMap((turn) => turn.items.map((item) => projectItem(item, thread)));
+  const entries = thread.turns.flatMap((turn) => turn.items.flatMap((item) => projectUserItems(item, thread)));
   if (new Set(entries.map((entry) => entry.id)).size !== entries.length) throw new Error("Duplicate Codex history item id");
   let end = entries.length;
   if (options.before !== undefined) {

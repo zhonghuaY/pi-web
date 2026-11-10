@@ -17,7 +17,7 @@ import { getAllowedFileRoots, isExistingFilePathAllowed } from "@/lib/file-acces
 import { codexEnabled } from "@/lib/agent-backends/codex/descriptor";
 import { isAbsolute, normalize } from "node:path";
 import { projectCodexSessionInfo } from "@/lib/agent-backends/codex/projection";
-import { codexSkills, codexMcp, forkCodexSession, compactCodexSession, answerCodexInteraction, codexModels, getCodexSession, updateCodexSettings, createCodexSession, ensureCodexSession, promptCodexSession, steerCodexSession, stopCodexSession, subscribeCodexSession, codexSessionState, codexTurnSnapshot, parseCodexRequestId, parseCodexWebId, type Result } from "@/lib/agent-backends/codex";
+import { codexSkills, codexMcp, forkCodexSession, compactCodexSession, answerCodexInteraction, codexModels, getCodexSession, updateCodexSettings, createCodexSession, ensureCodexSession, promptCodexSession, streamingCodexSession, clearCodexQueue, stopCodexSession, subscribeCodexSession, codexSessionState, codexTurnSnapshot, parseCodexRequestId, parseCodexWebId, type Result } from "@/lib/agent-backends/codex";
 
 function codexFailure(result: Extract<Result<never>, { ok: false }>, sessionId?: string) {
   const failure = result.error;
@@ -52,10 +52,10 @@ async function commandCodexRuntime(id: string, body: { type: string; [key: strin
   const webId = parseCodexWebId(id);
   if (!webId) return invalidCodex("Invalid Codex session id");
   if (typeof body.type !== "string" || !body.type) return invalidCodex("Invalid Codex command");
-  if (body.type !== "prompt" && body.type !== "abort" && body.type !== "get_state" && body.type !== "answer_interaction" && body.type !== "set_settings" && body.type !== "compact") return { status: 400, body: { error: "Unsupported Codex command", code: "unsupported" } };
+  if (body.type !== "prompt" && body.type !== "abort" && body.type !== "clear_queue" && body.type !== "get_state" && body.type !== "answer_interaction" && body.type !== "set_settings" && body.type !== "compact") return { status: 400, body: { error: "Unsupported Codex command", code: "unsupported" } };
   const requestId = parseCodexRequestId(body.requestId);
   if (body.type === "compact" && (!onlyFields(body, ["type", "requestId"]) || (body.requestId !== undefined && !requestId))) return invalidCodex("Native compaction does not support custom instructions or options");
-  if (body.type === "set_settings" ? (!onlyFields(body, ["type", "model", "effort"]) || typeof body.model !== "string" || !body.model || typeof body.effort !== "string" || !body.effort) : body.type === "prompt" ? (!requestId || typeof body.message !== "string" || !body.message.trim() || !onlyFields(body, ["type", "requestId", "message", "streamingBehavior"]) || (body.streamingBehavior !== undefined && body.streamingBehavior !== "steer")) : body.type === "answer_interaction" ? (!onlyFields(body, ["type", "id", "approved", "answers", "cancelled"]) || typeof body.id !== "string" || [body.approved !== undefined, body.answers !== undefined, body.cancelled !== undefined].filter(Boolean).length !== 1 || (body.cancelled !== undefined && body.cancelled !== true)) : body.type === "compact" ? false : !onlyFields(body, ["type"])) return invalidCodex("Invalid Codex command");
+  if (body.type === "set_settings" ? (!onlyFields(body, ["type", "model", "effort"]) || typeof body.model !== "string" || !body.model || typeof body.effort !== "string" || !body.effort) : body.type === "prompt" ? (!requestId || typeof body.message !== "string" || !body.message.trim() || !onlyFields(body, ["type", "requestId", "message", "streamingBehavior"]) || (body.streamingBehavior !== undefined && body.streamingBehavior !== "steer" && body.streamingBehavior !== "followUp")) : body.type === "answer_interaction" ? (!onlyFields(body, ["type", "id", "approved", "answers", "cancelled"]) || typeof body.id !== "string" || [body.approved !== undefined, body.answers !== undefined, body.cancelled !== undefined].filter(Boolean).length !== 1 || (body.cancelled !== undefined && body.cancelled !== true)) : body.type === "compact" ? false : !onlyFields(body, ["type"])) return invalidCodex("Invalid Codex command");
   const ensured = await ensureCodexSession(webId);
   if (!ensured.ok) return codexFailure(ensured, webId);
   if (body.type === "set_settings" && typeof body.model === "string" && typeof body.effort === "string") {
@@ -67,6 +67,10 @@ async function commandCodexRuntime(id: string, body: { type: string; [key: strin
     return compacted.ok ? { status: 200, body: { success: true, data: compacted.value } } : codexFailure(compacted, webId);
   }
   if (body.type === "get_state") return { status: 200, body: { success: true, data: codexSessionState(ensured.value) } };
+  if (body.type === "clear_queue") {
+    const cleared = clearCodexQueue(ensured.value);
+    return cleared.ok ? { status: 200, body: { success: true, data: cleared.value } } : codexFailure(cleared, webId);
+  }
   if (body.type === "answer_interaction") {
     const answered = answerCodexInteraction(ensured.value, body);
     return answered.ok ? { status: 200, body: { success: true, data: answered.value } } : codexFailure(answered, webId);
@@ -76,7 +80,11 @@ async function commandCodexRuntime(id: string, body: { type: string; [key: strin
     return stopped.ok ? { status: 200, body: { success: true, data: stopped.value } } : codexFailure(stopped, webId);
   }
   const input = { requestId: requestId!, message: body.message as string };
-  const prompted = body.streamingBehavior === "steer" ? await steerCodexSession(ensured.value, input) : await promptCodexSession(ensured.value, input);
+  if (body.streamingBehavior === "steer" || body.streamingBehavior === "followUp") {
+    const queued = await streamingCodexSession(ensured.value, input, body.streamingBehavior);
+    return queued.ok ? { status: 200, body: { success: true, data: queued.value } } : codexFailure(queued, webId);
+  }
+  const prompted = await promptCodexSession(ensured.value, input);
   return prompted.ok ? { status: 200, body: { success: true, data: { turnId: prompted.value.turnId } } } : codexFailure(prompted, webId);
 }
 

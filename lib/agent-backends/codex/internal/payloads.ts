@@ -72,9 +72,9 @@ export type CodexPayloads = {
   "thread/start:response": ThreadResponse;
   "thread/resume:request": { threadId: string };
   "thread/resume:response": ThreadResponse;
-  "turn/start:request": { threadId: string; input: unknown[] };
+  "turn/start:request": { threadId: string; input: unknown[]; clientUserMessageId?: string | null };
   "turn/start:response": { turn: Turn };
-  "turn/steer:request": { threadId: string; expectedTurnId: string; input: unknown[] };
+  "turn/steer:request": { threadId: string; expectedTurnId: string; input: unknown[]; clientUserMessageId?: string | null };
   "turn/steer:response": { turnId: string };
   "turn/interrupt:request": { threadId: string; turnId: string };
   "turn/interrupt:response": Record<string, unknown>;
